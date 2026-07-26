@@ -2,7 +2,6 @@ import asyncio
 import logging
 import sqlite3
 import html
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -24,7 +23,6 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     
-    # Standart sozlamalar
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('start_text', 'Salom! Kino kodini yuboring:')")
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('help_text_status', 'on')")
     cursor.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (ASOSIY_ADMIN_ID,))
@@ -123,7 +121,7 @@ async def check_sub_callback(call: CallbackQuery):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if get_setting('help_text_status') == 'on':
-        await message.answer("Bu bot orqali kinolarni kod yuborish orqali qabul qilib olishingiz mumkin. Shunchaki kino kodini yuboring!")
+        await message.answer("Bu bot orqali kinolarni kod yuborish orqali topishingiz mumkin. Shunchaki kino kodini yuboring!")
 
 # --- ADMIN PANEL ---
 @dp.message(Command("admin"))
@@ -169,8 +167,7 @@ async def handle_admin_callbacks(call: CallbackQuery, state: FSMContext):
     d = call.data
     
     if d == "del_movie":
-        message_or_edit = call.message
-        await message_or_edit.answer("O'chirmoqchi bo'lgan kino kodini yuboring:", reply_markup=cancel_btn)
+        await call.message.answer("O'chirmoqchi bo'lgan kino kodini yuboring:", reply_markup=cancel_btn)
         await state.set_state(BotStates.del_movie)
     elif d == "add_chan":
         await call.message.answer("Kanalni qo'shish uchun uning havolasini yuboring (Masalan: `https://t.me/kanal_nomi` yoki `@kanal_nomi`):", reply_markup=cancel_btn, parse_mode="Markdown")
