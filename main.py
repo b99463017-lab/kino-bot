@@ -130,7 +130,7 @@ async def admin_cmd(message: Message):
     if is_admin(message.from_user.id):
         await message.answer("🔧 Admin panelga xush kelibsiz. Nima qilamiz?", reply_markup=admin_menu)
 
-# --- KINO QO'SHISH (Boshqa kanaldan forward qilish orqali) ---
+# --- KINO QO'SHISH ---
 @dp.callback_query(F.data == "add_movie")
 async def add_movie_start(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id): return
@@ -168,7 +168,7 @@ async def handle_admin_callbacks(call: CallbackQuery, state: FSMContext):
     d = call.data
     
     if d == "del_movie":
-        await message_or_edit = call.message
+        message_or_edit = call.message
         await message_or_edit.answer("O'chirmoqchi bo'lgan kino kodini yuboring:", reply_markup=cancel_btn)
         await state.set_state(BotStates.del_movie)
     elif d == "add_chan":
@@ -291,7 +291,7 @@ async def toggle_help(call: CallbackQuery):
     conn.commit()
     await call.answer(f"Yordam xabari {'O‘CHIRILDI' if new_stat=='off' else 'YOQILDI'}", show_alert=True)
 
-# --- STATISTIKA (Foydalanuvchilar niki va ID'si bilan) ---
+# --- STATISTIKA ---
 @dp.callback_query(F.data == "stats")
 async def show_stats(call: CallbackQuery):
     if not is_admin(call.from_user.id): return
@@ -300,7 +300,6 @@ async def show_stats(call: CallbackQuery):
     cursor.execute("SELECT COUNT(*) FROM movies")
     m_count = cursor.fetchone()[0]
     
-    # Oxirgi 15 ta foydalanuvchini niki va ID si bilan olish
     cursor.execute("SELECT id, full_name, username FROM users ORDER BY id DESC LIMIT 15")
     last_users = cursor.fetchall()
     
@@ -319,7 +318,7 @@ async def show_stats(call: CallbackQuery):
     await call.message.answer(stat_text, parse_mode="HTML")
     await call.answer()
 
-# --- KOD ORQALI KINO QIDIRISH (ODDIY XABAR) ---
+# --- KOD ORQALI KINO QIDIRISH ---
 @dp.message()
 async def search_movie(message: Message):
     unsubbed = await check_sub(message.from_user.id)
