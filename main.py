@@ -1,7 +1,10 @@
 import asyncio
 import logging
-import sqlite3
 import html
+import os
+import aiosqlite
+from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
@@ -13,35 +16,35 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.states import StatesGroup, State
 
 # --- SOZLAMALAR ---
-BOT_TOKEN = "8989891347:AAHaN14lyx4PnbLFwYcx_jNlI26wHuv0sFQ"
-ASOSIY_ADMIN_ID = 8488028783 # O'zingizning Telegram ID raqamingizni yozing
+load_dotenv() # .env faylidan ma'lumotlarni o'qish
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ASOSIY_ADMIN_ID = int(os.getenv("ASOSIY_ADMIN_ID", 0))
 
-# --- BAZA BILAN ISHLASH (SQLite) ---
-conn = sqlite3.connect('database.db', check_same_thread=False)
-cursor = conn.cursor()
+# --- BAZA BILAN ISHLASH (aiosqlite) ---
+DB_NAME = 'database.db'
+db: aiosqlite.Connection = None # Global baza obyekti
 
-def init_db():
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, full_name TEXT, username TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, file_id TEXT, type TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, link TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+async def init_db():
+    await db.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, full_name TEXT, username TEXT)''')
+    await db.execute('''CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, file_id TEXT, type TEXT)''')
+    await db.execute('''CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, link TEXT)''')
+    await db.execute('''CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY)''')
+    await db.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('start_text', 'Salom! Kino kodini yuboring:')")
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('help_text_status', 'on')")
-    cursor.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (ASOSIY_ADMIN_ID,))
-    conn.commit()
+    await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('start_text', 'Salom! Kino kodini yuboring:')")
+    await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('help_text_status', 'on')")
+    await db.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (ASOSIY_ADMIN_ID,))
+    await db.commit()
 
-init_db()
+async def get_setting(key):
+    async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as cursor:
+        res = await cursor.fetchone()
+        return res[0] if res else None
 
-def get_setting(key):
-    cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-    res = cursor.fetchone()
-    return res[0] if res else None
-
-def is_admin(user_id):
-    cursor.execute("SELECT id FROM admins WHERE id=?", (user_id,))
-    return True if cursor.fetchone() else False
+async def is_admin(user_id):
+    async with db.execute("SELECT id FROM admins WHERE id=?", (user_id,)) as cursor:
+        res = await cursor.fetchone()
+        return bool(res)
 
 # --- FSM HOLATLAR ---
 class BotStates(StatesGroup):
@@ -73,16 +76,18 @@ dp = Dispatcher()
 
 # --- MAJBURIY OBUNA TEKSHIRUVI ---
 async def check_sub(user_id):
-    cursor.execute("SELECT id, link FROM channels")
-    channels = cursor.fetchall()
+    async with db.execute("SELECT id, link FROM channels") as cursor:
+        channels = await cursor.fetchall()
+        
     unsubbed = []
     for ch_id, ch_link in channels:
         try:
             member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
             if member.status in ['left', 'kicked']:
                 unsubbed.append(ch_link)
-        except Exception:
-            pass 
+        except Exception as e:
+            logging.error(f"Kanal tekshirishda xatolik ({ch_id}): {e}")
+            # Agar bot kanalda admin bo'lmasa, uni obuna ro'yxatiga qo'shmaymiz
     return unsubbed
 
 # --- BEKOR QILISH ---
@@ -90,16 +95,16 @@ async def check_sub(user_id):
 async def cancel_process(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Jarayon bekor qilindi.", reply_markup=ReplyKeyboardRemove())
-    if is_admin(message.from_user.id):
+    if await is_admin(message.from_user.id):
         await message.answer("Admin paneliga qaytdingiz:", reply_markup=admin_menu)
 
 # --- START VA YORDAM ---
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     user = message.from_user
-    cursor.execute("INSERT OR IGNORE INTO users (id, full_name, username) VALUES (?, ?, ?)", 
+    await db.execute("INSERT OR IGNORE INTO users (id, full_name, username) VALUES (?, ?, ?)", 
                    (user.id, user.full_name, user.username))
-    conn.commit()
+    await db.commit()
 
     unsubbed = await check_sub(user.id)
     if unsubbed:
@@ -109,7 +114,7 @@ async def start_cmd(message: Message):
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
         return
 
-    start_text = get_setting('start_text')
+    start_text = await get_setting('start_text')
     await message.answer(start_text, reply_markup=ReplyKeyboardRemove())
 
 @dp.callback_query(F.data == "check_sub")
@@ -119,34 +124,35 @@ async def check_sub_callback(call: CallbackQuery):
         await call.answer("Barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
     else:
         await call.message.delete()
-        start_text = get_setting('start_text')
+        start_text = await get_setting('start_text')
         await call.message.answer("Ajoyib! " + start_text)
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    if get_setting('help_text_status') == 'on':
+    if await get_setting('help_text_status') == 'on':
         await message.answer("Bu bot orqali kinolarni kod yuborish orqali topishingiz mumkin. Shunchaki kino kodini yuboring!")
 
 # --- ADMIN PANEL ---
 @dp.message(Command("admin"))
 async def admin_cmd(message: Message):
-    if is_admin(message.from_user.id):
+    if await is_admin(message.from_user.id):
         await message.answer("🔧 Admin panelga xush kelibsiz. Nima qilamiz?", reply_markup=admin_menu)
 
 # --- KINO QO'SHISH ---
 @dp.callback_query(F.data == "add_movie")
 async def add_movie_start(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not await is_admin(call.from_user.id): return
     await call.message.answer("Kino uchun kod kiriting (masalan: 101):", reply_markup=cancel_btn)
     await state.set_state(BotStates.add_movie_code)
 
 @dp.message(BotStates.add_movie_code)
 async def add_movie_code_catch(message: Message, state: FSMContext):
     code = message.text.strip()
-    cursor.execute("SELECT code FROM movies WHERE code=?", (code,))
-    if cursor.fetchone():
-        await message.answer("Bu kod band! Boshqa kod kiriting yoki ❌ Bekor qiling:")
-        return
+    async with db.execute("SELECT code FROM movies WHERE code=?", (code,)) as cursor:
+        if await cursor.fetchone():
+            await message.answer("Bu kod band! Boshqa kod kiriting yoki ❌ Bekor qiling:")
+            return
+            
     await state.update_data(code=code)
     await message.answer("Endi istalgan kanaldan kino videofaylini yoki hujjatini ushbu botga **forward** qiling (yo'llang):", reply_markup=cancel_btn)
     await state.set_state(BotStates.add_movie_file)
@@ -158,8 +164,8 @@ async def add_movie_file_catch(message: Message, state: FSMContext):
     file_id = message.video.file_id if message.video else message.document.file_id
     file_type = "video" if message.video else "document"
     
-    cursor.execute("INSERT INTO movies (code, file_id, type) VALUES (?, ?, ?)", (code, file_id, file_type))
-    conn.commit()
+    await db.execute("INSERT INTO movies (code, file_id, type) VALUES (?, ?, ?)", (code, file_id, file_type))
+    await db.commit()
     await state.clear()
     await message.answer(f"✅ Kino muvaffaqiyatli qo'shildi!\nKodi: <b>{code}</b>", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
     await message.answer("Admin panel:", reply_markup=admin_menu)
@@ -167,7 +173,7 @@ async def add_movie_file_catch(message: Message, state: FSMContext):
 # --- QOLGAN ADMIN AMALLARI ---
 @dp.callback_query(F.data.in_(["del_movie", "add_chan", "del_chan", "add_admin", "del_admin", "change_start", "broadcast"]))
 async def handle_admin_callbacks(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not await is_admin(call.from_user.id): return
     d = call.data
     
     if d == "del_movie":
@@ -177,8 +183,9 @@ async def handle_admin_callbacks(call: CallbackQuery, state: FSMContext):
         await call.message.answer("Kanalni qo'shish uchun uning havolasini yuboring (Masalan: `https://t.me/kanal_nomi` yoki `@kanal_nomi`):", reply_markup=cancel_btn, parse_mode="Markdown")
         await state.set_state(BotStates.add_channel)
     elif d == "del_chan":
-        cursor.execute("SELECT id, link FROM channels")
-        chans = cursor.fetchall()
+        async with db.execute("SELECT id, link FROM channels") as cursor:
+            chans = await cursor.fetchall()
+            
         if not chans:
             await call.answer("Hozircha kanallar yo'q!", show_alert=True)
             return
@@ -201,8 +208,8 @@ async def handle_admin_callbacks(call: CallbackQuery, state: FSMContext):
 # --- FSM QABUL QILUVCHILAR ---
 @dp.message(BotStates.del_movie)
 async def delete_movie(message: Message, state: FSMContext):
-    cursor.execute("DELETE FROM movies WHERE code=?", (message.text.strip(),))
-    conn.commit()
+    await db.execute("DELETE FROM movies WHERE code=?", (message.text.strip(),))
+    await db.commit()
     await state.clear()
     await message.answer("✅ Kino bazadan o'chirildi (agar mavjud bo'lgan bo'lsa).", reply_markup=ReplyKeyboardRemove())
 
@@ -214,19 +221,20 @@ async def add_channel(message: Message, state: FSMContext):
         ch_id = str(chat.id)
         ch_link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else text)
         
-        cursor.execute("INSERT OR REPLACE INTO channels (id, link) VALUES (?, ?)", (ch_id, ch_link))
-        conn.commit()
+        await db.execute("INSERT OR REPLACE INTO channels (id, link) VALUES (?, ?)", (ch_id, ch_link))
+        await db.commit()
         await state.clear()
         await message.answer(f"✅ Kanal muvaffaqiyatli qo'shildi!\nID: {ch_id}", reply_markup=ReplyKeyboardRemove())
-        if is_admin(message.from_user.id):
+        if await is_admin(message.from_user.id):
             await message.answer("Admin panel:", reply_markup=admin_menu)
     except Exception as e:
+        logging.error(f"Kanal qo'shishda xato: {e}")
         await message.answer(f"❌ Kanalni topib bo'lmadi yoki bot o'sha kanalda admin emas!\n\nXatolik: {e}\n\nQaytadan to'g'ri havola yoki username yuboring:", reply_markup=cancel_btn)
 
 @dp.message(BotStates.del_channel)
 async def del_channel(message: Message, state: FSMContext):
-    cursor.execute("DELETE FROM channels WHERE id=?", (message.text.strip(),))
-    conn.commit()
+    await db.execute("DELETE FROM channels WHERE id=?", (message.text.strip(),))
+    await db.commit()
     await state.clear()
     await message.answer("✅ Kanal o'chirildi.", reply_markup=ReplyKeyboardRemove())
 
@@ -237,8 +245,8 @@ async def add_admin(message: Message, state: FSMContext):
         if new_admin_id == ASOSIY_ADMIN_ID:
             await message.answer("Bu asosiy admin!")
         else:
-            cursor.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (new_admin_id,))
-            conn.commit()
+            await db.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", (new_admin_id,))
+            await db.commit()
             await message.answer("✅ Yangi admin qo'shildi.", reply_markup=ReplyKeyboardRemove())
     except ValueError:
         await message.answer("Faqat raqam (ID) yuboring!")
@@ -252,8 +260,8 @@ async def del_admin(message: Message, state: FSMContext):
         if del_id == ASOSIY_ADMIN_ID:
             await message.answer("Asosiy adminni o'chirib bo'lmaydi!")
         else:
-            cursor.execute("DELETE FROM admins WHERE id=?", (del_id,))
-            conn.commit()
+            await db.execute("DELETE FROM admins WHERE id=?", (del_id,))
+            await db.commit()
             await message.answer("✅ Admin olib tashlandi.", reply_markup=ReplyKeyboardRemove())
     except ValueError:
         await message.answer("Faqat raqam (ID) yuboring!")
@@ -262,8 +270,8 @@ async def del_admin(message: Message, state: FSMContext):
 
 @dp.message(BotStates.set_start_text)
 async def set_start(message: Message, state: FSMContext):
-    cursor.execute("UPDATE settings SET value=? WHERE key='start_text'", (message.text,))
-    conn.commit()
+    await db.execute("UPDATE settings SET value=? WHERE key='start_text'", (message.text,))
+    await db.commit()
     await state.clear()
     await message.answer("✅ Start matni yangilandi.", reply_markup=ReplyKeyboardRemove())
 
@@ -271,39 +279,44 @@ async def set_start(message: Message, state: FSMContext):
 async def broadcast_msg(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("📢 Xabar tarqatish boshlandi...", reply_markup=ReplyKeyboardRemove())
-    cursor.execute("SELECT id FROM users")
-    users = cursor.fetchall()
+    
+    async with db.execute("SELECT id FROM users") as cursor:
+        users = await cursor.fetchall()
+        
     count = 0
     for u in users:
         try:
             await message.send_copy(chat_id=u[0])
             count += 1
-            await asyncio.sleep(0.04)
-        except Exception:
-            pass
+            await asyncio.sleep(0.04) # Telegram cheklovlariga tushmaslik uchun
+        except Exception as e:
+            logging.warning(f"Foydalanuvchiga yuborib bo'lmadi ({u[0]}): {e}")
+            
     await message.answer(f"✅ Xabar jami {count} ta foydalanuvchiga yetkazildi.")
 
 # --- YORDAM YOQISH/O'CHIRISH ---
 @dp.callback_query(F.data == "toggle_help")
 async def toggle_help(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    current = get_setting('help_text_status')
+    if not await is_admin(call.from_user.id): return
+    current = await get_setting('help_text_status')
     new_stat = 'off' if current == 'on' else 'on'
-    cursor.execute("UPDATE settings SET value=? WHERE key='help_text_status'", (new_stat,))
-    conn.commit()
+    await db.execute("UPDATE settings SET value=? WHERE key='help_text_status'", (new_stat,))
+    await db.commit()
     await call.answer(f"Yordam xabari {'O‘CHIRILDI' if new_stat=='off' else 'YOQILDI'}", show_alert=True)
 
 # --- STATISTIKA ---
 @dp.callback_query(F.data == "stats")
 async def show_stats(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    cursor.execute("SELECT COUNT(*) FROM users")
-    u_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM movies")
-    m_count = cursor.fetchone()[0]
+    if not await is_admin(call.from_user.id): return
     
-    cursor.execute("SELECT id, full_name, username FROM users ORDER BY id DESC LIMIT 15")
-    last_users = cursor.fetchall()
+    async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+        u_count = (await cursor.fetchone())[0]
+        
+    async with db.execute("SELECT COUNT(*) FROM movies") as cursor:
+        m_count = (await cursor.fetchone())[0]
+    
+    async with db.execute("SELECT id, full_name, username FROM users ORDER BY id DESC LIMIT 15") as cursor:
+        last_users = await cursor.fetchall()
     
     users_list = ""
     for u in last_users:
@@ -329,8 +342,8 @@ async def search_movie(message: Message):
         return
 
     code = message.text.strip()
-    cursor.execute("SELECT file_id, type FROM movies WHERE code=?", (code,))
-    movie = cursor.fetchone()
+    async with db.execute("SELECT file_id, type FROM movies WHERE code=?", (code,)) as cursor:
+        movie = await cursor.fetchone()
     
     if movie:
         file_id, m_type = movie
@@ -339,14 +352,27 @@ async def search_movie(message: Message):
         else:
             await message.answer_document(document=file_id, caption=f"🎬 Kino kodi: {code}")
     else:
-        if not is_admin(message.from_user.id):
+        if not await is_admin(message.from_user.id):
             await message.answer("❌ Bunday kod bilan kino topilmadi.")
+
+# --- STARTUP VA SHUTDOWN FUNKSIYALARI ---
+async def on_startup():
+    global db
+    db = await aiosqlite.connect(DB_NAME)
+    await init_db()
+    logging.info("Bot ma'lumotlar bazasiga ulandi va ishga tushdi...")
+
+async def on_shutdown():
+    if db:
+        await db.close()
+    logging.info("Bot to'xtatildi va baza yopildi.")
 
 # --- ISHGA TUSHIRISH ---
 async def main():
-    print("Bot muvaffaqiyatli ishga tushdi...")
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     asyncio.run(main())
