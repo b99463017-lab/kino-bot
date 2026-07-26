@@ -3,7 +3,11 @@ import logging
 import sqlite3
 import html
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, 
+    InlineKeyboardButton, ReplyKeyboardMarkup, 
+    KeyboardButton, ReplyKeyboardRemove
+)
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.states import StatesGroup, State
@@ -99,7 +103,7 @@ async def start_cmd(message: Message):
 
     unsubbed = await check_sub(user.id)
     if unsubbed:
-        btns = [[InlineKeyboardButton(text=f"📢 Kanalga obuna bo'lish", url=link)] for link in unsubbed]
+        btns = [[InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=link)] for link in unsubbed]
         btns.append([InlineKeyboardButton(text="✅ Obuna bo'ldim", callback_data="check_sub")])
         await message.answer("Kinolarni ko'rish uchun avval quyidagi kanallarga obuna bo'ling:", 
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
