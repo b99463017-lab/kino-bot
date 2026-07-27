@@ -13,8 +13,7 @@ from aiogram.types import (
 )
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.states import StatesGroup, State
-
+from aiogram.fsm.state import StatesGroup, State
 # --- SOZLAMALAR ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
