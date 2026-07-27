@@ -235,6 +235,9 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
 #                MAJBURIY OBUNA TEKSHIRUVI
 # ============================================================
 async def check_subscription(user_id: int, target_code: str | None = None) -> InlineKeyboardMarkup | None:
+    if user_id in ADMIN_IDS:
+        return None
+
     cur = await db.execute("SELECT chat_id, link FROM channels")
     channels = await cur.fetchall()
     if not channels:
@@ -244,15 +247,15 @@ async def check_subscription(user_id: int, target_code: str | None = None) -> In
     for row in channels:
         ch_id, ch_link = row["chat_id"], row["link"]
         try:
+            if ch_id and not ch_id.startswith("-100") and not ch_id.startswith("@"):
+                ch_id = "@" + ch_id
+
             member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
-            if member.status in ("left", "kicked"):
+            if member.status in ("left", "kicked", "restricted"):
                 unsubbed.append(ch_link)
-        except TelegramBadRequest as e:
-            # Bot kanalda admin emas yoki kanal topilmadi — obuna tekshirib bo'lmaydi,
-            # ammo foydalanuvchini bloklab qo'ymaslik uchun log qilib o'tkazib yuboramiz.
-            logger.warning("Kanal %s tekshirilmadi: %s", ch_id, e)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Obuna tekshiruvida kutilmagan xato (%s): %s", ch_id, e)
+        except Exception as e:
+            logger.error(f"Obuna tekshirishda xato ({ch_id}): {e}")
+            unsubbed.append(ch_link)
 
     if unsubbed:
         btns = [[InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=link)] for link in unsubbed]
@@ -338,8 +341,6 @@ async def sub_check_callback(call: CallbackQuery) -> None:
         )
 
 
-# Faqat FSM holati bo'lmaganda ishlaydi — aks holda admin flow (kod kiritish va h.k.)
-# bilan to'qnashib qolmaydi.
 @router.message(F.text.regexp(r"^[A-Za-z0-9_-]+$"), StateFilter(None))
 async def search_handler(message: Message) -> None:
     code = message.text.strip()
@@ -506,7 +507,6 @@ async def admin_stats(call: CallbackQuery) -> None:
     await call.answer()
 
 
-# --- SOZLAMALARNI O'ZGARTIRISH ---
 @router.callback_query(F.data == "admin:edit_start", IsAdmin())
 async def edit_start_prompt(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(
@@ -559,7 +559,6 @@ async def save_insta_text(message: Message, state: FSMContext) -> None:
     await state.clear()
 
 
-# --- KATALOG (SAHIFALASH BILAN) VA O'CHIRISH ---
 def _catalog_keyboard(page: int, has_next: bool) -> InlineKeyboardMarkup:
     nav = []
     if page > 0:
@@ -581,12 +580,6 @@ async def show_catalog(call: CallbackQuery) -> None:
     )
     movies = await cur.fetchall()
 
-    remaining = CATALOG_PAGE_SIZE - min(len(movies), CATALOG_PAGE_SIZE)
-    cur = await db.execute(
-        "SELECT DISTINCT code, title FROM series ORDER BY code LIMIT ? OFFSET ?",
-        (remaining + 1, max(0, offset - await _movies_total(offset))),
-    )
-    # Sodda va tushunarli bo'lishi uchun kinolar va seriallarni alohida ko'rsatamiz.
     text = "🗂 <b>BAZA (KATALOG)</b>\n\n<b>🎬 KINOLAR:</b>\n"
     shown_movies = movies[:CATALOG_PAGE_SIZE]
     if shown_movies:
@@ -613,11 +606,6 @@ async def show_catalog(call: CallbackQuery) -> None:
     except TelegramBadRequest:
         await call.message.answer(text[:4000], reply_markup=kb)
     await call.answer()
-
-
-async def _movies_total(offset: int) -> int:
-    cur = await db.execute("SELECT COUNT(*) c FROM movies")
-    return (await cur.fetchone())["c"]
 
 
 @router.callback_query(F.data == "admin:delete", IsAdmin())
@@ -691,29 +679,24 @@ async def ask_channel_id(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AddChannel.chat_id, IsAdmin())
 async def ask_channel_link(message: Message, state: FSMContext) -> None:
-    chat_id = None
-    
-    # 1. Agar kanaldan xabar forward qilingan bo'lsa
     if message.forward_from_chat and message.forward_from_chat.type == "channel":
         chat_id = str(message.forward_from_chat.id)
     else:
         text = (message.text or "").strip()
         if not text:
-            await message.answer("⚠️ Iltimos, kanal havolasini yuboring yoki kanaldan xabar forward qiling.")
+            await message.answer("⚠️ Iltimos, kanal ID/username yuboring yoki xabarni forward qiling.")
             return
         
-        # 2. Agar t.me havolasi yuborilgan bo'lsa
         if "t.me/" in text:
             clean_link = text.split("?")[0].rstrip("/")
             username = clean_link.split("/")[-1]
             if username and "+" not in username and "joinchat" not in username:
                 chat_id = "@" + username
-        elif text.startswith("@"):
-            chat_id = text
-        elif text.startswith("-100"):
+            else:
+                chat_id = text
+        elif text.startswith("@") or text.startswith("-100"):
             chat_id = text
         else:
-            # Agar shunchaki nom yozilgan bo'lsa
             chat_id = "@" + text
 
     if not chat_id:
@@ -978,9 +961,9 @@ async def run_broadcast(call: CallbackQuery, state: FSMContext) -> None:
             try:
                 await bot.copy_message(chat_id=uid, from_chat_id=data["chat_id"], message_id=data["message_id"])
                 sent += 1
-            except Exception:  # noqa: BLE001
+            except Exception:
                 failed += 1
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("Broadcast xatosi (user=%s): %s", uid, e)
             failed += 1
         await asyncio.sleep(BROADCAST_DELAY)
