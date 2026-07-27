@@ -3,7 +3,7 @@ import logging
 import sqlite3
 import os
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -12,15 +12,15 @@ from dotenv import load_dotenv
 # --- SOZLAMALAR ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-INSTAGRAM_LINK = "https://instagram.com/sizning_sahifangiz" # O'zingiznikiga o'zgartiring
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+INSTAGRAM_LINK = "https://instagram.com/sizning_sahifangiz"  # O'zingiznikiga o'zgartiring
 DB_NAME = "kino_bot.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# --- BAZA BILAN ISHLASH (Xavfsiz funksiya) ---
+# --- BAZA BILAN ISHLASH ---
 def db_query(query, args=(), fetchone=False, fetchall=False, commit=False):
     with sqlite3.connect(DB_NAME) as conn:
         cur = conn.cursor()
@@ -53,9 +53,9 @@ class AddMovie(StatesGroup):
 
 class AddSeries(StatesGroup):
     code = State()
-    title = State()       # Yangi serial bo'lsa
-    section_choice = State() # Mavjud bo'limni tanlash yoki yangi qo'shish
-    section = State()     # Yangi bo'lim nomi
+    title = State()
+    section_choice = State()
+    section = State()
     episode = State()
     video = State()
 
@@ -95,10 +95,7 @@ async def check_subscription(user_id, target_code=None):
         return InlineKeyboardMarkup(inline_keyboard=btns)
     return None
 
-# ==========================================
-#              FOYDALANUVCHI QISMI
-# ==========================================
-
+# --- FOYDALANUVCHI QISMI ---
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message, command: CommandObject):
     db_query("INSERT OR IGNORE INTO users (id, full_name) VALUES (?, ?)", (message.from_user.id, message.from_user.full_name), commit=True)
@@ -139,16 +136,13 @@ async def search_handler(message: types.Message):
         return
     await process_search_code(message.chat.id, code)
 
-# --- QIDIRUV MANTIQI (Kino va Serialni farqlash) ---
 async def process_search_code(chat_id, code):
-    # Avval kinolardan qidiramiz
     movie = db_query("SELECT title, file_id FROM movies WHERE code=?", (code,), fetchone=True)
     if movie:
         title, file_id = movie
         await send_video_with_share(chat_id, code, title, file_id, is_series=False)
         return
     
-    # Kinolarda yo'q bo'lsa, seriallardan qidiramiz (Bo'limlarni chiqaramiz)
     sections = db_query("SELECT DISTINCT section FROM series WHERE code=? ORDER BY section", (code,), fetchall=True)
     if sections:
         title = db_query("SELECT title FROM series WHERE code=? LIMIT 1", (code,), fetchone=True)[0]
@@ -161,7 +155,6 @@ async def process_search_code(chat_id, code):
         
     await bot.send_message(chat_id, f"❌ <b>{code}</b> kodli kino yoki serial topilmadi.", parse_mode="HTML")
 
-# --- SERIAL BO'LIM BOSILGANDA ---
 @dp.callback_query(F.data.startswith("sec:"))
 async def show_episodes(call: CallbackQuery):
     _, code, section_name = call.data.split(":")
@@ -179,7 +172,6 @@ async def show_episodes(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=btns)
     await call.message.edit_text(f"📁 Bo'lim: <b>{section_name}</b>\nQismni tanlang:", reply_markup=kb, parse_mode="HTML")
 
-# --- QISM BOSILGANDA (Video yuborish) ---
 @dp.callback_query(F.data.startswith("ep:"))
 async def send_episode(call: CallbackQuery):
     ep_id = call.data.split(":")[1]
@@ -199,10 +191,7 @@ async def send_video_with_share(chat_id, code, title, file_id, is_series=False):
     
     await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, parse_mode="HTML", reply_markup=kb)
 
-# ==========================================
-#                 ADMIN PANEL
-# ==========================================
-
+# --- ADMIN PANEL ---
 @dp.message(lambda m: m.text == "⚙️ Admin panel")
 async def admin_panel(message: types.Message):
     if message.from_user.id == ADMIN_ID:
@@ -224,7 +213,6 @@ async def show_catalog(call: CallbackQuery):
     await call.message.answer(text, parse_mode="HTML")
     await call.answer()
 
-# --- 1. KINO QO'SHISH ---
 @dp.callback_query(F.data == "admin:add_movie")
 async def start_add_movie(call: CallbackQuery, state: FSMContext):
     await call.message.answer("🎬 Yakkalik kino kodini kiriting (Masalan: 101):")
@@ -257,8 +245,6 @@ async def process_movie_video(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Kino muvaffaqiyatli saqlandi!\nKod: {data['code']}")
     await state.clear()
 
-
-# --- 2. SERIAL QO'SHISH (AQLLI TIZIM) ---
 @dp.callback_query(F.data == "admin:add_series")
 async def start_add_series(call: CallbackQuery, state: FSMContext):
     await call.message.answer("📺 Serial kodini kiriting (Masalan: 200):")
@@ -269,7 +255,6 @@ async def process_series_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
     await state.update_data(code=code)
     
-    # Kod bazada bormi tekshiramiz
     existing = db_query("SELECT title FROM series WHERE code=? LIMIT 1", (code,), fetchone=True)
     
     if existing:
