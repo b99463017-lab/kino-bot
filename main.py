@@ -358,8 +358,7 @@ async def search_handler(message: Message, state: FSMContext) -> None:
         await state.update_data(pending_code=code)
         await message.answer("Avval obuna bo'ling:", reply_markup=sub_kb)
         return
-    await process_search_code(message.chat.id, code)
-
+state_data = await state.get_data()
 
 async def process_search_code(chat_id: int, code: str) -> None:
     cur = await db.execute("SELECT title, file_id FROM movies WHERE code=?", (code,))
