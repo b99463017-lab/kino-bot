@@ -71,7 +71,6 @@ async def init_db() -> None:
         "CREATE TABLE IF NOT EXISTS users ("
         "id INTEGER PRIMARY KEY, full_name TEXT, joined_at TEXT)"
     )
-    # channels jadvaliga rowid o'rniga aniq id ustunini qo'shamiz (callback_data muammosi bo'lmasligi uchun)
     await db.execute(
         """CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -237,7 +236,7 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
 # ============================================================
 #                MAJBURIY OBUNA TEKSHIRUVI
 # ============================================================
-async def check_subscription(user_id: int, target_code: str | None = None) -> InlineKeyboardMarkup | None:
+async def check_subscription(user_id: int) -> InlineKeyboardMarkup | None:
     if user_id in ADMIN_IDS:
         return None
 
@@ -271,8 +270,8 @@ async def check_subscription(user_id: int, target_code: str | None = None) -> In
         if insta_link and insta_link.lower() != "none":
             btns.append([InlineKeyboardButton(text="📸 Instagram sahifamiz", url=insta_link)])
 
-        cb_data = f"sub_check:{target_code}" if target_code else "sub_check:none"
-        btns.append([InlineKeyboardButton(text="✅ Obuna bo'ldim", callback_data=cb_data)])
+        # Callback data uzunligi oshib ketmasligi uchun statik kalit ishlatamiz
+        btns.append([InlineKeyboardButton(text="✅ Obuna bo'ldim", callback_data="sub_check")])
         return InlineKeyboardMarkup(inline_keyboard=btns)
     return None
 
@@ -291,7 +290,10 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     await db.commit()
 
     code = command.args.strip() if command.args else None
-    sub_kb = await check_subscription(message.from_user.id, target_code=code)
+    if code:
+        await state.update_data(pending_code=code)
+
+    sub_kb = await check_subscription(message.from_user.id)
 
     if sub_kb:
         await message.answer("🍿 Kinoni ko'rish uchun avval kanallarimizga obuna bo'ling:", reply_markup=sub_kb)
@@ -327,17 +329,18 @@ async def search_prompt(message: Message) -> None:
     await message.answer("🔢 Qidirmoqchi bo'lgan kino yoki serial kodini yuboring:")
 
 
-@router.callback_query(F.data.startswith("sub_check:"))
-async def sub_check_callback(call: CallbackQuery) -> None:
-    code = call.data.split(":", 1)[1]
-    code = None if code == "none" else code
-
-    sub_kb = await check_subscription(call.from_user.id, target_code=code)
+@router.callback_query(F.data == "sub_check")
+async def sub_check_callback(call: CallbackQuery, state: FSMContext) -> None:
+    sub_kb = await check_subscription(call.from_user.id)
     if sub_kb:
         await call.answer("❌ Hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
         return
 
     await call.message.delete()
+    data = await state.get_data()
+    code = data.get("pending_code")
+    await state.clear()
+
     if code:
         await process_search_code(call.message.chat.id, code)
     else:
@@ -351,8 +354,10 @@ async def sub_check_callback(call: CallbackQuery) -> None:
 @router.message(F.text.regexp(r"^[A-Za-z0-9_-]+$"), StateFilter(None))
 async def search_handler(message: Message) -> None:
     code = message.text.strip()
-    sub_kb = await check_subscription(message.from_user.id, target_code=code)
+    sub_kb = await check_subscription(message.from_user.id)
     if sub_kb:
+        await state_data = await dp.fsm.get_context(bot, message.from_user.id, message.chat.id)
+        await state_data.update_data(pending_code=code)
         await message.answer("Avval obuna bo'ling:", reply_markup=sub_kb)
         return
     await process_search_code(message.chat.id, code)
@@ -748,7 +753,6 @@ async def del_channels_menu(call: CallbackQuery) -> None:
         await call.answer("Bazada kanallar yo'q!", show_alert=True)
         return
 
-    # CALLBACK_DATA UZUNLIK LIMITIDAN Qochish uchun chat_id o'rniga jadvaldagi id ishlatildi
     btns = [
         [InlineKeyboardButton(text=f"❌ O'chirish: {row['chat_id']}", callback_data=f"del_ch:{row['id']}")]
         for row in channels
@@ -759,8 +763,8 @@ async def del_channels_menu(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("del_ch:"), IsAdmin())
 async def process_del_channel(call: CallbackQuery) -> None:
-    ch_db_id = call.data.split(":", 1)[1]
-    await db.execute("DELETE FROM channels WHERE id=?", (ch_db_id,))
+    ch_id = call.data.split(":", 1)[1]
+    await db.execute("DELETE FROM channels WHERE id=?", (ch_id,))
     await db.commit()
     await call.message.delete()
     await call.answer("Kanal o'chirildi!", show_alert=True)
