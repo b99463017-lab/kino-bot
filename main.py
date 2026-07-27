@@ -60,8 +60,6 @@ class AddSeries(StatesGroup):
     video = State()
 
 # --- ASOSIY MENYU ---
-def get_main_keyboard(user_id):
-    keyboard = [[KeyboardButton(text="🔍 Qidiruv (Kino/Serial)")]]
     if user_id == ADMIN_ID:
         keyboard.append([KeyboardButton(text="⚙️ Admin panel")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
