@@ -18,12 +18,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from dotenv import load_dotenv
 
@@ -36,14 +36,13 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi! .env faylida BOT_TOKEN qiymatini kiriting.")
 
-# Bir nechta adminni qo'llab-quvvatlaymiz: ADMIN_IDS=111,222,333
 _admin_raw = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", "0")
 ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", _admin_raw.strip()) if x.isdigit()}
 
 DB_NAME = os.getenv("DB_NAME", "kino_bot.db")
 CATALOG_PAGE_SIZE = 12
 EPISODES_PER_ROW = 4
-BROADCAST_DELAY = 0.05  # so'rovlar orasidagi tanaffus (flood limitdan qochish uchun)
+BROADCAST_DELAY = 0.05
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,7 +62,6 @@ db: aiosqlite.Connection | None = None
 #                    MA'LUMOTLAR BAZASI (ASYNC)
 # ============================================================
 async def init_db() -> None:
-    """Bazani ochish, jadval va standart sozlamalarni yaratish."""
     global db
     db = await aiosqlite.connect(DB_NAME)
     db.row_factory = aiosqlite.Row
@@ -247,10 +245,14 @@ async def check_subscription(user_id: int, target_code: str | None = None) -> In
     for row in channels:
         ch_id, ch_link = row["chat_id"], row["link"]
         try:
-            if ch_id and not ch_id.startswith("-100") and not ch_id.startswith("@"):
-                ch_id = "@" + ch_id
+            target_chat = ch_id
+            if not target_chat.startswith("-100") and not target_chat.startswith("@") and not target_chat.startswith("-"):
+                if target_chat.isdigit():
+                    target_chat = "-100" + target_chat
+                else:
+                    target_chat = "@" + target_chat
 
-            member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
+            member = await bot.get_chat_member(chat_id=target_chat, user_id=user_id)
             if member.status in ("left", "kicked", "restricted"):
                 unsubbed.append(ch_link)
         except Exception as e:
@@ -518,7 +520,7 @@ async def edit_start_prompt(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(EditSettings.start_text, IsAdmin())
 async def save_start_text(message: Message, state: FSMContext) -> None:
-    new_text = message.html_text or message.text
+    new_text = message.text
     await set_setting("start", new_text)
     await message.answer("✅ Start matni muvaffaqiyatli o'zgartirildi!", reply_markup=get_main_keyboard(message.from_user.id))
     await state.clear()
@@ -532,7 +534,7 @@ async def edit_help_prompt(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(EditSettings.help_text, IsAdmin())
 async def save_help_text(message: Message, state: FSMContext) -> None:
-    new_text = message.html_text or message.text
+    new_text = message.text
     await set_setting("help", new_text)
     await message.answer("✅ Yordam matni muvaffaqiyatli o'zgartirildi!", reply_markup=get_main_keyboard(message.from_user.id))
     await state.clear()
@@ -679,7 +681,8 @@ async def ask_channel_id(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AddChannel.chat_id, IsAdmin())
 async def ask_channel_link(message: Message, state: FSMContext) -> None:
-    if message.forward_from_chat and message.forward_from_chat.type == "channel":
+    chat_id = None
+    if message.forward_from_chat and message.forward_from_chat.type in ("channel", "supergroup"):
         chat_id = str(message.forward_from_chat.id)
     else:
         text = (message.text or "").strip()
@@ -694,8 +697,12 @@ async def ask_channel_link(message: Message, state: FSMContext) -> None:
                 chat_id = "@" + username
             else:
                 chat_id = text
-        elif text.startswith("@") or text.startswith("-100"):
+        elif text.startswith("@"):
             chat_id = text
+        elif text.startswith("-100") or (text.startswith("-") and text[1:].isdigit()):
+            chat_id = text
+        elif text.isdigit():
+            chat_id = "-100" + text
         else:
             chat_id = "@" + text
 
@@ -974,8 +981,8 @@ async def run_broadcast(call: CallbackQuery, state: FSMContext) -> None:
 # ============================================================
 #                 XATOLARNI USHLASH
 # ============================================================
-@dp.errors()
-async def global_error_handler(event) -> bool:
+@dp.error()
+async def global_error_handler(event: ErrorEvent) -> bool:
     logger.exception("Kutilmagan xatolik: %s", event.exception)
     return True
 
