@@ -691,30 +691,39 @@ async def ask_channel_id(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AddChannel.chat_id, IsAdmin())
 async def ask_channel_link(message: Message, state: FSMContext) -> None:
+    chat_id = None
+    
+    # 1. Agar kanaldan xabar forward qilingan bo'lsa
     if message.forward_from_chat and message.forward_from_chat.type == "channel":
         chat_id = str(message.forward_from_chat.id)
     else:
-        chat_id = (message.text or "").strip()
-        if not chat_id:
-            await message.answer("⚠️ Iltimos, kanal ID/username yuboring yoki xabarni forward qiling.")
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer("⚠️ Iltimos, kanal havolasini yuboring yoki kanaldan xabar forward qiling.")
             return
-        if chat_id.startswith("https://t.me/") and "+" not in chat_id and "joinchat" not in chat_id:
-            chat_id = "@" + chat_id.split("/")[-1]
+        
+        # 2. Agar t.me havolasi yuborilgan bo'lsa
+        if "t.me/" in text:
+            clean_link = text.split("?")[0].rstrip("/")
+            username = clean_link.split("/")[-1]
+            if username and "+" not in username and "joinchat" not in username:
+                chat_id = "@" + username
+        elif text.startswith("@"):
+            chat_id = text
+        elif text.startswith("-100"):
+            chat_id = text
+        else:
+            # Agar shunchaki nom yozilgan bo'lsa
+            chat_id = "@" + text
 
-    # Bot kanalda ishlay olishini oldindan tekshiramiz.
-    try:
-        await bot.get_chat(chat_id)
-    except TelegramBadRequest:
-        await message.answer(
-            "⚠️ Botni ushbu kanalga <b>admin</b> qilib qo'shganingizga ishonch hosil qiling, "
-            "so'ng qaytadan urinib ko'ring."
-        )
+    if not chat_id:
+        await message.answer("⚠️ Havola yoki kanal formati noto'g'ri. Qaytadan urinib ko'ring:")
         return
 
     await state.update_data(chat_id=chat_id)
     await message.answer(
-        f"✅ Kanal ID olindi: <b>{html.escape(chat_id)}</b>\n\n"
-        "🔗 Endi obuna tugmasi ishlashi uchun kanal havolasini (linkini) yuboring:"
+        f"✅ Kanal qabul qilindi: <b>{html.escape(chat_id)}</b>\n\n"
+        "🔗 Endi obuna tugmasi ishlashi uchun kanal havolasining o'zini yuboring:"
     )
     await state.set_state(AddChannel.link)
 
