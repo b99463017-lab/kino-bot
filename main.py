@@ -1,135 +1,288 @@
 import asyncio
+import html
 import logging
-import sqlite3
 import os
+import re
 import urllib.parse
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command, CommandObject
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.fsm.state import StatesGroup, State
+from datetime import datetime, timezone
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from dotenv import load_dotenv
 
-# --- SOZLAMALAR ---
+# ============================================================
+#                        SOZLAMALAR
+# ============================================================
 load_dotenv()
+
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-DB_NAME = "kino_bot.db"
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi! .env faylida BOT_TOKEN qiymatini kiriting.")
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-logging.basicConfig(level=logging.INFO)
+# Bir nechta adminni qo'llab-quvvatlaymiz: ADMIN_IDS=111,222,333
+_admin_raw = os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID", "0")
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", _admin_raw.strip()) if x.isdigit()}
 
-# --- BAZA BILAN ISHLASH ---
-def db_query(query, args=(), fetchone=False, fetchall=False, commit=False):
-    with sqlite3.connect(DB_NAME) as conn:
-        cur = conn.cursor()
-        cur.execute(query, args)
-        if commit:
-            conn.commit()
-        if fetchone:
-            return cur.fetchone()
-        if fetchall:
-            return cur.fetchall()
+DB_NAME = os.getenv("DB_NAME", "kino_bot.db")
+CATALOG_PAGE_SIZE = 12
+EPISODES_PER_ROW = 4
+BROADCAST_DELAY = 0.05  # so'rovlar orasidagi tanaffus (flood limitdan qochish uchun)
 
-def init_db():
-    db_query("""CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, full_name TEXT)""", commit=True)
-    db_query("""CREATE TABLE IF NOT EXISTS channels (chat_id TEXT PRIMARY KEY, link TEXT)""", commit=True)
-    db_query("""CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, title TEXT, file_id TEXT)""", commit=True)
-    db_query("""
-        CREATE TABLE IF NOT EXISTS series (
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("kino_bot")
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+db: aiosqlite.Connection | None = None
+
+
+# ============================================================
+#                    MA'LUMOTLAR BAZASI (ASYNC)
+# ============================================================
+async def init_db() -> None:
+    """Bazani ochish, jadval va standart sozlamalarni yaratish."""
+    global db
+    db = await aiosqlite.connect(DB_NAME)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL;")
+
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS users ("
+        "id INTEGER PRIMARY KEY, full_name TEXT, joined_at TEXT)"
+    )
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS channels (chat_id TEXT PRIMARY KEY, link TEXT)"
+    )
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, title TEXT, file_id TEXT, added_at TEXT)"
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS series (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT, title TEXT, section TEXT, episode TEXT, file_id TEXT
-        )
-    """, commit=True)
-    db_query("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""", commit=True)
-    
-    # Standart sozlamalarni kiritish
-    if not db_query("SELECT value FROM settings WHERE key='start'", fetchone=True):
-        db_query("INSERT INTO settings (key, value) VALUES ('start', '👋 Xush kelibsiz! Kino yoki serial kodini yuboring:')", commit=True)
-    if not db_query("SELECT value FROM settings WHERE key='help'", fetchone=True):
-        db_query("INSERT INTO settings (key, value) VALUES ('help', '💡 <b>Yordam</b>\n\nBotdan foydalanish uchun shunchaki qidirayotgan kino yoki serialingiz kodini yuboring.')", commit=True)
-    if not db_query("SELECT value FROM settings WHERE key='instagram'", fetchone=True):
-        db_query("INSERT INTO settings (key, value) VALUES ('instagram', 'https://instagram.com/')", commit=True)
+            code TEXT NOT NULL,
+            title TEXT NOT NULL,
+            section TEXT,
+            episode TEXT,
+            file_id TEXT NOT NULL,
+            added_at TEXT
+        )"""
+    )
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_series_code ON series(code)")
+    await db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    await db.commit()
 
-init_db()
+    defaults = {
+        "start": "👋 Xush kelibsiz! Kino yoki serial kodini yuboring:",
+        "help": (
+            "💡 <b>Yordam</b>\n\n"
+            "Botdan foydalanish uchun shunchaki qidirayotgan kino yoki "
+            "serialingiz kodini yuboring."
+        ),
+        "instagram": "https://instagram.com/",
+    }
+    for key, value in defaults.items():
+        cur = await db.execute("SELECT 1 FROM settings WHERE key=?", (key,))
+        if not await cur.fetchone():
+            await db.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
+    await db.commit()
+    logger.info("Baza tayyor: %s", DB_NAME)
 
-# --- HOLATLAR (FSM) ---
+
+async def get_setting(key: str) -> str:
+    cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = await cur.fetchone()
+    return row["value"] if row else ""
+
+
+async def set_setting(key: str, value: str) -> None:
+    await db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    await db.commit()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ============================================================
+#                    HOLATLAR (FSM)
+# ============================================================
 class AddMovie(StatesGroup):
-    code, title, video = State(), State(), State()
+    code = State()
+    title = State()
+    video = State()
+
 
 class AddSeries(StatesGroup):
-    code, title, section_choice, section, episode, video = State(), State(), State(), State(), State(), State()
+    code = State()
+    title = State()
+    section_choice = State()
+    section = State()
+    episode = State()
+    video = State()
+
 
 class AddChannel(StatesGroup):
-    chat_id, link = State(), State()
+    chat_id = State()
+    link = State()
+
 
 class DeleteMedia(StatesGroup):
     code = State()
+    confirm = State()
+
 
 class EditSettings(StatesGroup):
-    start_text, help_text, instagram = State(), State(), State()
+    start_text = State()
+    help_text = State()
+    instagram = State()
 
-# --- ASOSIY MENYU VA ADMIN KEYBOARD ---
-def get_main_keyboard(user_id):
+
+class Broadcast(StatesGroup):
+    content = State()
+    confirm = State()
+
+
+# ============================================================
+#                    FILTRLAR
+# ============================================================
+class IsAdmin(BaseFilter):
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        return event.from_user is not None and event.from_user.id in ADMIN_IDS
+
+
+CANCEL_TEXT = "🚫 Bekor qilish"
+
+
+# ============================================================
+#                    KLAVIATURALAR
+# ============================================================
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton(text="🔍 Qidiruv (Kino/Serial)")],
-        [KeyboardButton(text="🆘 Yordam")]
+        [KeyboardButton(text="🆘 Yordam")],
     ]
-    if user_id == ADMIN_ID:
+    if user_id in ADMIN_IDS:
         keyboard.append([KeyboardButton(text="⚙️ Admin panel")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-def get_admin_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Kino qo'shish", callback_data="admin:add_movie"),
-         InlineKeyboardButton(text="📺 Serial qo'shish", callback_data="admin:add_series")],
-        [InlineKeyboardButton(text="🗂 Katalog (Baza)", callback_data="admin:catalog"),
-         InlineKeyboardButton(text="🗑 O'chirish", callback_data="admin:delete")],
-        [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="admin:add_channel"),
-         InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="admin:del_channel")],
-        [InlineKeyboardButton(text="✍️ Start matnini o'zgarish", callback_data="admin:edit_start")],
-        [InlineKeyboardButton(text="✍️ Yordam matnini o'zgartirish", callback_data="admin:edit_help")],
-        [InlineKeyboardButton(text="📸 Instagram havolasi", callback_data="admin:edit_insta")]
-    ])
 
-# --- MAJBURIY OBUNA TEKSHIRUVI ---
-async def check_subscription(user_id, target_code=None):
-    channels = db_query("SELECT chat_id, link FROM channels", fetchall=True)
+def get_cancel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=CANCEL_TEXT)]], resize_keyboard=True
+    )
+
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎬 Kino qo'shish", callback_data="admin:add_movie"),
+                InlineKeyboardButton(text="📺 Serial qo'shish", callback_data="admin:add_series"),
+            ],
+            [
+                InlineKeyboardButton(text="🗂 Katalog (Baza)", callback_data="admin:catalog:0"),
+                InlineKeyboardButton(text="🗑 O'chirish", callback_data="admin:delete"),
+            ],
+            [
+                InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="admin:add_channel"),
+                InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="admin:del_channel"),
+            ],
+            [
+                InlineKeyboardButton(text="✍️ Start matnini o'zgartirish", callback_data="admin:edit_start"),
+            ],
+            [
+                InlineKeyboardButton(text="✍️ Yordam matnini o'zgartirish", callback_data="admin:edit_help"),
+            ],
+            [
+                InlineKeyboardButton(text="📸 Instagram havolasi", callback_data="admin:edit_insta"),
+            ],
+            [
+                InlineKeyboardButton(text="📣 Habar yuborish (Broadcast)", callback_data="admin:broadcast"),
+                InlineKeyboardButton(text="📊 Statistika", callback_data="admin:stats"),
+            ],
+        ]
+    )
+
+
+# ============================================================
+#                MAJBURIY OBUNA TEKSHIRUVI
+# ============================================================
+async def check_subscription(user_id: int, target_code: str | None = None) -> InlineKeyboardMarkup | None:
+    cur = await db.execute("SELECT chat_id, link FROM channels")
+    channels = await cur.fetchall()
+    if not channels:
+        return None
+
     unsubbed = []
-    
-    for ch_id, ch_link in channels:
+    for row in channels:
+        ch_id, ch_link = row["chat_id"], row["link"]
         try:
             member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
-            if member.status in ['left', 'kicked']:
-                unsubbed.append((ch_link, "📢 Kanalga obuna bo'lish"))
-        except:
-            unsubbed.append((ch_link, "📢 Kanalga obuna bo'lish"))
+            if member.status in ("left", "kicked"):
+                unsubbed.append(ch_link)
+        except TelegramBadRequest as e:
+            # Bot kanalda admin emas yoki kanal topilmadi — obuna tekshirib bo'lmaydi,
+            # ammo foydalanuvchini bloklab qo'ymaslik uchun log qilib o'tkazib yuboramiz.
+            logger.warning("Kanal %s tekshirilmadi: %s", ch_id, e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Obuna tekshiruvida kutilmagan xato (%s): %s", ch_id, e)
 
     if unsubbed:
-        btns = [[InlineKeyboardButton(text=title, url=link)] for link, title in unsubbed]
-        
-        # Instagram sozlamasini bazadan olish
-        insta_link = db_query("SELECT value FROM settings WHERE key='instagram'", fetchone=True)[0]
+        btns = [[InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=link)] for link in unsubbed]
+
+        insta_link = await get_setting("instagram")
         if insta_link and insta_link.lower() != "none":
             btns.append([InlineKeyboardButton(text="📸 Instagram sahifamiz", url=insta_link)])
-            
+
         cb_data = f"sub_check:{target_code}" if target_code else "sub_check:none"
         btns.append([InlineKeyboardButton(text="✅ Obuna bo'ldim", callback_data=cb_data)])
         return InlineKeyboardMarkup(inline_keyboard=btns)
     return None
 
-# ==========================================
-#              FOYDALANUVCHI QISMI
-# ==========================================
 
-@dp.message(CommandStart())
-async def start_cmd(message: types.Message, command: CommandObject):
-    db_query("INSERT OR IGNORE INTO users (id, full_name) VALUES (?, ?)", (message.from_user.id, message.from_user.full_name), commit=True)
-    
+# ============================================================
+#              FOYDALANUVCHI QISMI
+# ============================================================
+@router.message(CommandStart())
+async def start_cmd(message: Message, command: CommandObject, state: FSMContext) -> None:
+    await state.clear()
+    await db.execute(
+        "INSERT INTO users (id, full_name, joined_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET full_name=excluded.full_name",
+        (message.from_user.id, message.from_user.full_name, now_iso()),
+    )
+    await db.commit()
+
     code = command.args.strip() if command.args else None
     sub_kb = await check_subscription(message.from_user.id, target_code=code)
-    
+
     if sub_kb:
         await message.answer("🍿 Kinoni ko'rish uchun avval kanallarimizga obuna bo'ling:", reply_markup=sub_kb)
         return
@@ -137,33 +290,58 @@ async def start_cmd(message: types.Message, command: CommandObject):
     if code:
         await process_search_code(message.chat.id, code)
     else:
-        start_text = db_query("SELECT value FROM settings WHERE key='start'", fetchone=True)[0]
-        await message.answer(start_text, reply_markup=get_main_keyboard(message.from_user.id), parse_mode="HTML")
+        start_text = await get_setting("start")
+        await message.answer(start_text, reply_markup=get_main_keyboard(message.from_user.id))
 
-@dp.message(F.text == "🆘 Yordam")
-@dp.message(Command("help"))
-async def help_cmd(message: types.Message):
-    help_text = db_query("SELECT value FROM settings WHERE key='help'", fetchone=True)[0]
-    await message.answer(help_text, parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("sub_check:"))
-async def sub_check_callback(call: CallbackQuery):
-    code = call.data.split(":")[1]
+@router.message(Command("cancel"), StateFilter("*"))
+@router.message(F.text == CANCEL_TEXT, StateFilter("*"))
+async def cancel_handler(message: Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("Bekor qilinadigan hech narsa yo'q.", reply_markup=get_main_keyboard(message.from_user.id))
+        return
+    await state.clear()
+    await message.answer("❌ Amal bekor qilindi.", reply_markup=get_main_keyboard(message.from_user.id))
+
+
+@router.message(F.text == "🆘 Yordam", StateFilter(None))
+@router.message(Command("help"), StateFilter(None))
+async def help_cmd(message: Message) -> None:
+    help_text = await get_setting("help")
+    await message.answer(help_text)
+
+
+@router.message(F.text == "🔍 Qidiruv (Kino/Serial)", StateFilter(None))
+async def search_prompt(message: Message) -> None:
+    await message.answer("🔢 Qidirmoqchi bo'lgan kino yoki serial kodini yuboring:")
+
+
+@router.callback_query(F.data.startswith("sub_check:"))
+async def sub_check_callback(call: CallbackQuery) -> None:
+    code = call.data.split(":", 1)[1]
     code = None if code == "none" else code
-    
+
     sub_kb = await check_subscription(call.from_user.id, target_code=code)
     if sub_kb:
         await call.answer("❌ Hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
-    else:
-        await call.message.delete()
-        if code:
-            await process_search_code(call.message.chat.id, code)
-        else:
-            start_text = db_query("SELECT value FROM settings WHERE key='start'", fetchone=True)[0]
-            await call.message.answer(f"✅ Rahmat! Obuna tasdiqlandi.\n\n{start_text}", reply_markup=get_main_keyboard(call.from_user.id), parse_mode="HTML")
+        return
 
-@dp.message(lambda m: m.text and m.text.isdigit())
-async def search_handler(message: types.Message):
+    await call.message.delete()
+    if code:
+        await process_search_code(call.message.chat.id, code)
+    else:
+        start_text = await get_setting("start")
+        await call.message.answer(
+            f"✅ Rahmat! Obuna tasdiqlandi.\n\n{start_text}",
+            reply_markup=get_main_keyboard(call.from_user.id),
+        )
+
+
+# Faqat FSM holati bo'lmaganda ishlaydi — aks holda admin flow (kod kiritish va h.k.)
+# bilan to'qnashib qolmaydi.
+@router.message(F.text.regexp(r"^[A-Za-z0-9_-]+$"), StateFilter(None))
+async def search_handler(message: Message) -> None:
     code = message.text.strip()
     sub_kb = await check_subscription(message.from_user.id, target_code=code)
     if sub_kb:
@@ -171,290 +349,668 @@ async def search_handler(message: types.Message):
         return
     await process_search_code(message.chat.id, code)
 
-async def process_search_code(chat_id, code):
-    movie = db_query("SELECT title, file_id FROM movies WHERE code=?", (code,), fetchone=True)
-    if movie:
-        title, file_id = movie
-        await send_video_with_share(chat_id, code, title, file_id, is_series=False)
-        return
-    
-    sections = db_query("SELECT DISTINCT section FROM series WHERE code=? AND section IS NOT NULL ORDER BY section", (code,), fetchall=True)
-    if sections:
-        title = db_query("SELECT title FROM series WHERE code=? LIMIT 1", (code,), fetchone=True)[0]
-        btns = []
-        for sec in sections:
-            btns.append([InlineKeyboardButton(text=sec[0], callback_data=f"sec:{code}:{sec[0]}")])
-        kb = InlineKeyboardMarkup(inline_keyboard=btns)
-        await bot.send_message(chat_id, f"📺 <b>{title}</b>\n\nKerakli bo'limni tanlang:", reply_markup=kb, parse_mode="HTML")
-        return
-        
-    await bot.send_message(chat_id, f"❌ <b>{code}</b> kodli kino yoki serial topilmadi.", parse_mode="HTML")
 
-@dp.callback_query(F.data.startswith("sec:"))
-async def show_episodes(call: CallbackQuery):
-    _, code, section_name = call.data.split(":")
-    episodes = db_query("SELECT id, episode FROM series WHERE code=? AND section=?", (code, section_name), fetchall=True)
-    
-    btns = []
-    row = []
-    for ep_id, ep_num in episodes:
-        row.append(InlineKeyboardButton(text=f"{ep_num}", callback_data=f"ep:{ep_id}"))
-        if len(row) == 4:
+async def process_search_code(chat_id: int, code: str) -> None:
+    cur = await db.execute("SELECT title, file_id FROM movies WHERE code=?", (code,))
+    movie = await cur.fetchone()
+    if movie:
+        await send_video_with_share(chat_id, code, movie["title"], movie["file_id"], is_series=False)
+        return
+
+    cur = await db.execute(
+        "SELECT DISTINCT section FROM series WHERE code=? AND section IS NOT NULL ORDER BY section",
+        (code,),
+    )
+    sections = await cur.fetchall()
+    if sections:
+        cur = await db.execute("SELECT title FROM series WHERE code=? LIMIT 1", (code,))
+        title_row = await cur.fetchone()
+        title = title_row["title"] if title_row else code
+
+        btns = [
+            [InlineKeyboardButton(text=row["section"], callback_data=f"sec:{code}:{row['section']}")]
+            for row in sections
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=btns)
+        await bot.send_message(
+            chat_id,
+            f"📺 <b>{html.escape(title)}</b>\n\nKerakli bo'limni tanlang:",
+            reply_markup=kb,
+        )
+        return
+
+    await bot.send_message(chat_id, f"❌ <b>{html.escape(code)}</b> kodli kino yoki serial topilmadi.")
+
+
+@router.callback_query(F.data.startswith("sec:"))
+async def show_episodes(call: CallbackQuery) -> None:
+    _, code, section_name = call.data.split(":", 2)
+    cur = await db.execute(
+        "SELECT id, episode FROM series WHERE code=? AND section=? ORDER BY id", (code, section_name)
+    )
+    episodes = await cur.fetchall()
+
+    btns, row = [], []
+    for ep in episodes:
+        row.append(InlineKeyboardButton(text=str(ep["episode"]), callback_data=f"ep:{ep['id']}"))
+        if len(row) == EPISODES_PER_ROW:
             btns.append(row)
             row = []
-    if row: btns.append(row)
-    
+    if row:
+        btns.append(row)
+    btns.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"backsec:{code}")])
+
     kb = InlineKeyboardMarkup(inline_keyboard=btns)
-    await call.message.edit_text(f"📁 Bo'lim: <b>{section_name}</b>\nQismni tanlang:", reply_markup=kb, parse_mode="HTML")
+    await call.message.edit_text(
+        f"📁 Bo'lim: <b>{html.escape(section_name)}</b>\nQismni tanlang:", reply_markup=kb
+    )
 
-@dp.callback_query(F.data.startswith("ep:"))
-async def send_episode(call: CallbackQuery):
-    ep_id = call.data.split(":")[1]
-    series_data = db_query("SELECT code, title, episode, file_id FROM series WHERE id=?", (ep_id,), fetchone=True)
-    if series_data:
-        code, title, episode, file_id = series_data
-        await call.message.delete()
-        await send_video_with_share(call.message.chat.id, code, f"{title} | {episode}", file_id, is_series=True)
 
-async def send_video_with_share(chat_id, code, title, file_id, is_series=False):
+@router.callback_query(F.data.startswith("backsec:"))
+async def back_to_sections(call: CallbackQuery) -> None:
+    code = call.data.split(":", 1)[1]
+    cur = await db.execute(
+        "SELECT DISTINCT section FROM series WHERE code=? AND section IS NOT NULL ORDER BY section", (code,)
+    )
+    sections = await cur.fetchall()
+    cur = await db.execute("SELECT title FROM series WHERE code=? LIMIT 1", (code,))
+    title_row = await cur.fetchone()
+    title = title_row["title"] if title_row else code
+
+    btns = [
+        [InlineKeyboardButton(text=row["section"], callback_data=f"sec:{code}:{row['section']}")]
+        for row in sections
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=btns)
+    await call.message.edit_text(
+        f"📺 <b>{html.escape(title)}</b>\n\nKerakli bo'limni tanlang:", reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("ep:"))
+async def send_episode(call: CallbackQuery) -> None:
+    ep_id = call.data.split(":", 1)[1]
+    cur = await db.execute(
+        "SELECT code, title, episode, file_id FROM series WHERE id=?", (ep_id,)
+    )
+    series_data = await cur.fetchone()
+    if not series_data:
+        await call.answer("❌ Bu qism topilmadi (ehtimol o'chirilgan).", show_alert=True)
+        return
+
+    await call.message.delete()
+    await send_video_with_share(
+        call.message.chat.id,
+        series_data["code"],
+        f"{series_data['title']} | {series_data['episode']}",
+        series_data["file_id"],
+        is_series=True,
+    )
+
+
+async def send_video_with_share(chat_id: int, code: str, title: str, file_id: str, is_series: bool = False) -> None:
     bot_info = await bot.get_me()
     safe_title = urllib.parse.quote(title)
-    share_url = f"https://t.me/share/url?url=https://t.me/{bot_info.username}?start={code}&text=%F0%9F%8D%BF%20{safe_title}%20ko'ring!"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Do'stlarga ulashish", url=share_url)]])
+    share_url = (
+        f"https://t.me/share/url?url=https://t.me/{bot_info.username}?start={code}"
+        f"&text=%F0%9F%8D%BF%20{safe_title}%20ko'ring!"
+    )
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🚀 Do'stlarga ulashish", url=share_url)]]
+    )
     type_str = "Serial" if is_series else "Kino"
-    caption = f"🎬 <b>{type_str}:</b> {title}\n🔢 <b>Kod:</b> {code}\n\n🤖 @{bot_info.username}"
-    
-    await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+    caption = (
+        f"🎬 <b>{type_str}:</b> {html.escape(title)}\n"
+        f"🔢 <b>Kod:</b> {html.escape(code)}\n\n"
+        f"🤖 @{bot_info.username}"
+    )
 
-# ==========================================
+    try:
+        await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=kb)
+    except TelegramBadRequest as e:
+        logger.error("Video yuborilmadi (chat=%s, code=%s): %s", chat_id, code, e)
+        await bot.send_message(
+            chat_id,
+            "⚠️ Kechirasiz, videoni yuborishda xatolik yuz berdi. Admin bilan bog'laning.",
+        )
+
+
+# ============================================================
 #                 ADMIN PANEL
-# ==========================================
+# ============================================================
+@router.message(F.text == "⚙️ Admin panel", IsAdmin(), StateFilter(None))
+async def admin_panel(message: Message) -> None:
+    await message.answer("🔧 Admin panelga xush kelibsiz. Nima qilamiz?", reply_markup=get_admin_keyboard())
 
-@dp.message(lambda m: m.text == "⚙️ Admin panel")
-async def admin_panel(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("🔧 Admin panelga xush kelibsiz. Nima qilamiz?", reply_markup=get_admin_keyboard())
 
-# --- SOZLAMALARNI O'ZGARTIRISH (Matnlar va Instagram) ---
-@dp.callback_query(F.data == "admin:edit_start")
-async def edit_start_prompt(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("📝 <b>Yangi Start matnini yuboring:</b>\n\n<i>(Matnda HTML taglaridan foydalanishingiz mumkin)</i>", parse_mode="HTML")
+@router.callback_query(F.data == "admin:stats", IsAdmin())
+async def admin_stats(call: CallbackQuery) -> None:
+    users_cnt = (await (await db.execute("SELECT COUNT(*) c FROM users")).fetchone())["c"]
+    movies_cnt = (await (await db.execute("SELECT COUNT(*) c FROM movies")).fetchone())["c"]
+    series_titles_cnt = (
+        await (await db.execute("SELECT COUNT(DISTINCT code) c FROM series")).fetchone()
+    )["c"]
+    episodes_cnt = (await (await db.execute("SELECT COUNT(*) c FROM series")).fetchone())["c"]
+    channels_cnt = (await (await db.execute("SELECT COUNT(*) c FROM channels")).fetchone())["c"]
+
+    text = (
+        "📊 <b>Bot statistikasi</b>\n\n"
+        f"👤 Foydalanuvchilar: <b>{users_cnt}</b>\n"
+        f"🎬 Kinolar: <b>{movies_cnt}</b>\n"
+        f"📺 Seriallar (nomi bo'yicha): <b>{series_titles_cnt}</b>\n"
+        f"🎞 Jami serial qismlari: <b>{episodes_cnt}</b>\n"
+        f"📢 Majburiy obuna kanallari: <b>{channels_cnt}</b>"
+    )
+    await call.message.answer(text)
+    await call.answer()
+
+
+# --- SOZLAMALARNI O'ZGARTIRISH ---
+@router.callback_query(F.data == "admin:edit_start", IsAdmin())
+async def edit_start_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer(
+        "📝 <b>Yangi Start matnini yuboring:</b>\n\n<i>(HTML taglaridan foydalanishingiz mumkin)</i>",
+        reply_markup=get_cancel_keyboard(),
+    )
     await state.set_state(EditSettings.start_text)
 
-@dp.message(EditSettings.start_text)
-async def save_start_text(message: types.Message, state: FSMContext):
+
+@router.message(EditSettings.start_text, IsAdmin())
+async def save_start_text(message: Message, state: FSMContext) -> None:
     new_text = message.html_text or message.text
-    db_query("UPDATE settings SET value=? WHERE key='start'", (new_text,), commit=True)
-    await message.answer("✅ Start matni muvaffaqiyatli o'zgartirildi!")
+    await set_setting("start", new_text)
+    await message.answer("✅ Start matni muvaffaqiyatli o'zgartirildi!", reply_markup=get_main_keyboard(message.from_user.id))
     await state.clear()
 
-@dp.callback_query(F.data == "admin:edit_help")
-async def edit_help_prompt(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("📝 <b>Yangi Yordam matnini yuboring:</b>", parse_mode="HTML")
+
+@router.callback_query(F.data == "admin:edit_help", IsAdmin())
+async def edit_help_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer("📝 <b>Yangi Yordam matnini yuboring:</b>", reply_markup=get_cancel_keyboard())
     await state.set_state(EditSettings.help_text)
 
-@dp.message(EditSettings.help_text)
-async def save_help_text(message: types.Message, state: FSMContext):
+
+@router.message(EditSettings.help_text, IsAdmin())
+async def save_help_text(message: Message, state: FSMContext) -> None:
     new_text = message.html_text or message.text
-    db_query("UPDATE settings SET value=? WHERE key='help'", (new_text,), commit=True)
-    await message.answer("✅ Yordam matni muvaffaqiyatli o'zgartirildi!")
+    await set_setting("help", new_text)
+    await message.answer("✅ Yordam matni muvaffaqiyatli o'zgartirildi!", reply_markup=get_main_keyboard(message.from_user.id))
     await state.clear()
 
-@dp.callback_query(F.data == "admin:edit_insta")
-async def edit_insta_prompt(call: CallbackQuery, state: FSMContext):
+
+@router.callback_query(F.data == "admin:edit_insta", IsAdmin())
+async def edit_insta_prompt(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(
-        "📸 <b>Yangi Instagram havolangizni yuboring (https://instagram.com/...).</b>\n\n"
-        "<i>Agar Instagram tugmasini umuman olib tashlamoqchi bo'lsangiz, shunchaki <b>none</b> deb yozing.</i>", 
-        parse_mode="HTML"
+        "📸 <b>Yangi Instagram havolangizni yuboring</b> (https://instagram.com/...).\n\n"
+        "<i>Agar Instagram tugmasini olib tashlamoqchi bo'lsangiz, shunchaki <b>none</b> deb yozing.</i>",
+        reply_markup=get_cancel_keyboard(),
     )
     await state.set_state(EditSettings.instagram)
 
-@dp.message(EditSettings.instagram)
-async def save_insta_text(message: types.Message, state: FSMContext):
+
+@router.message(EditSettings.instagram, IsAdmin())
+async def save_insta_text(message: Message, state: FSMContext) -> None:
     new_link = message.text.strip()
-    db_query("UPDATE settings SET value=? WHERE key='instagram'", (new_link,), commit=True)
-    await message.answer(f"✅ Instagram havolasi saqlandi:\n{new_link}")
+    if new_link.lower() != "none" and not re.match(r"^https?://", new_link):
+        await message.answer("⚠️ Havola https:// bilan boshlanishi kerak (yoki 'none' deb yozing). Qayta urinib ko'ring:")
+        return
+    await set_setting("instagram", new_link)
+    await message.answer(f"✅ Instagram havolasi saqlandi:\n{html.escape(new_link)}", reply_markup=get_main_keyboard(message.from_user.id))
     await state.clear()
 
-# --- KATALOG VA O'CHIRISH ---
-@dp.callback_query(F.data == "admin:catalog")
-async def show_catalog(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID: return
-    movies = db_query("SELECT code, title FROM movies", fetchall=True)
-    series_codes = db_query("SELECT DISTINCT code, title FROM series", fetchall=True)
-    
+
+# --- KATALOG (SAHIFALASH BILAN) VA O'CHIRISH ---
+def _catalog_keyboard(page: int, has_next: bool) -> InlineKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"admin:catalog:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"admin:catalog:{page + 1}"))
+    rows = [nav] if nav else []
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("admin:catalog:"), IsAdmin())
+async def show_catalog(call: CallbackQuery) -> None:
+    page = int(call.data.split(":")[2])
+    offset = page * CATALOG_PAGE_SIZE
+
+    cur = await db.execute(
+        "SELECT code, title FROM movies ORDER BY code LIMIT ? OFFSET ?",
+        (CATALOG_PAGE_SIZE + 1, offset),
+    )
+    movies = await cur.fetchall()
+
+    remaining = CATALOG_PAGE_SIZE - min(len(movies), CATALOG_PAGE_SIZE)
+    cur = await db.execute(
+        "SELECT DISTINCT code, title FROM series ORDER BY code LIMIT ? OFFSET ?",
+        (remaining + 1, max(0, offset - await _movies_total(offset))),
+    )
+    # Sodda va tushunarli bo'lishi uchun kinolar va seriallarni alohida ko'rsatamiz.
     text = "🗂 <b>BAZA (KATALOG)</b>\n\n<b>🎬 KINOLAR:</b>\n"
-    for c, t in movies: text += f"• {c} - {t}\n"
+    shown_movies = movies[:CATALOG_PAGE_SIZE]
+    if shown_movies:
+        for m in shown_movies:
+            text += f"• <code>{html.escape(m['code'])}</code> — {html.escape(m['title'])}\n"
+    else:
+        text += "— (yo'q)\n"
+
+    cur = await db.execute("SELECT DISTINCT code, title FROM series ORDER BY code LIMIT ? OFFSET ?", (CATALOG_PAGE_SIZE + 1, offset))
+    series_rows = await cur.fetchall()
     text += "\n<b>📺 SERIALLAR:</b>\n"
-    for c, t in series_codes: text += f"• {c} - {t}\n"
-        
-    await call.message.answer(text[:4000], parse_mode="HTML")
+    shown_series = series_rows[:CATALOG_PAGE_SIZE]
+    if shown_series:
+        for s in shown_series:
+            text += f"• <code>{html.escape(s['code'])}</code> — {html.escape(s['title'])}\n"
+    else:
+        text += "— (yo'q)\n"
+
+    has_next = len(movies) > CATALOG_PAGE_SIZE or len(series_rows) > CATALOG_PAGE_SIZE
+    kb = _catalog_keyboard(page, has_next)
+
+    try:
+        await call.message.edit_text(text[:4000], reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text[:4000], reply_markup=kb)
     await call.answer()
 
-@dp.callback_query(F.data == "admin:delete")
-async def ask_delete_code(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("🗑 O'chirish uchun Kino yoki Serial kodini yuboring:")
+
+async def _movies_total(offset: int) -> int:
+    cur = await db.execute("SELECT COUNT(*) c FROM movies")
+    return (await cur.fetchone())["c"]
+
+
+@router.callback_query(F.data == "admin:delete", IsAdmin())
+async def ask_delete_code(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer("🗑 O'chirish uchun Kino yoki Serial kodini yuboring:", reply_markup=get_cancel_keyboard())
     await state.set_state(DeleteMedia.code)
 
-@dp.message(DeleteMedia.code)
-async def process_delete(message: types.Message, state: FSMContext):
+
+@router.message(DeleteMedia.code, IsAdmin())
+async def confirm_delete(message: Message, state: FSMContext) -> None:
     code = message.text.strip()
-    db_query("DELETE FROM movies WHERE code=?", (code,), commit=True)
-    db_query("DELETE FROM series WHERE code=?", (code,), commit=True)
-    await message.answer(f"✅ {code} kodli barcha ma'lumotlar bazadan tozalandi.")
+    cur = await db.execute("SELECT title FROM movies WHERE code=?", (code,))
+    movie = await cur.fetchone()
+    cur = await db.execute("SELECT title FROM series WHERE code=? LIMIT 1", (code,))
+    series = await cur.fetchone()
+
+    if not movie and not series:
+        await message.answer(f"❌ <code>{html.escape(code)}</code> kodli hech narsa topilmadi.")
+        await state.clear()
+        return
+
+    title = movie["title"] if movie else series["title"]
+    await state.update_data(code=code)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data="del_confirm:yes"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="del_confirm:no"),
+            ]
+        ]
+    )
+    await message.answer(
+        f"⚠️ <b>{html.escape(title)}</b> (kod: <code>{html.escape(code)}</code>) "
+        f"ni bazadan butunlay o'chirishni tasdiqlaysizmi?",
+        reply_markup=kb,
+    )
+    await state.set_state(DeleteMedia.confirm)
+
+
+@router.callback_query(F.data.startswith("del_confirm:"), DeleteMedia.confirm, IsAdmin())
+async def process_delete(call: CallbackQuery, state: FSMContext) -> None:
+    answer = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    code = data.get("code")
+
+    if answer == "yes" and code:
+        await db.execute("DELETE FROM movies WHERE code=?", (code,))
+        await db.execute("DELETE FROM series WHERE code=?", (code,))
+        await db.commit()
+        await call.message.edit_text(f"✅ <code>{html.escape(code)}</code> kodli barcha ma'lumotlar bazadan tozalandi.")
+    else:
+        await call.message.edit_text("❌ O'chirish bekor qilindi.")
+
     await state.clear()
+    await call.answer()
+
 
 # --- KANAL QO'SHISH / O'CHIRISH ---
-@dp.callback_query(F.data == "admin:add_channel")
-async def ask_channel_id(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "admin:add_channel", IsAdmin())
+async def ask_channel_id(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(
         "📢 <b>Kanalni qanday qo'shamiz?</b>\n\n"
         "1. Kanal ID raqamini yozing (masalan: <code>-10012345678</code>)\n"
         "2. Yoki ommaviy username'ni yozing (masalan: <code>@kanal_nomi</code>)\n"
-        "3. <b>YOKI ENG OSONI:</b> O'sha kanaldan ixtiyoriy bitta xabarni menga <b>Forward</b> (uzatish) qilib yuboring.",
-        parse_mode="HTML"
+        "3. <b>YOKI ENG OSONI:</b> o'sha kanaldan ixtiyoriy bitta xabarni menga "
+        "<b>Forward</b> (uzatish) qilib yuboring.",
+        reply_markup=get_cancel_keyboard(),
     )
     await state.set_state(AddChannel.chat_id)
 
-@dp.message(AddChannel.chat_id)
-async def ask_channel_link(message: types.Message, state: FSMContext):
+
+@router.message(AddChannel.chat_id, IsAdmin())
+async def ask_channel_link(message: Message, state: FSMContext) -> None:
     if message.forward_from_chat and message.forward_from_chat.type == "channel":
         chat_id = str(message.forward_from_chat.id)
     else:
-        chat_id = message.text.strip()
+        chat_id = (message.text or "").strip()
+        if not chat_id:
+            await message.answer("⚠️ Iltimos, kanal ID/username yuboring yoki xabarni forward qiling.")
+            return
         if chat_id.startswith("https://t.me/") and "+" not in chat_id and "joinchat" not in chat_id:
             chat_id = "@" + chat_id.split("/")[-1]
 
+    # Bot kanalda ishlay olishini oldindan tekshiramiz.
+    try:
+        await bot.get_chat(chat_id)
+    except TelegramBadRequest:
+        await message.answer(
+            "⚠️ Botni ushbu kanalga <b>admin</b> qilib qo'shganingizga ishonch hosil qiling, "
+            "so'ng qaytadan urinib ko'ring."
+        )
+        return
+
     await state.update_data(chat_id=chat_id)
-    await message.answer(f"✅ Kanal ID olindi: <b>{chat_id}</b>\n\n🔗 Endi obuna tugmasi ishlashi uchun kanal havolasini (linkini) yuboring:", parse_mode="HTML")
+    await message.answer(
+        f"✅ Kanal ID olindi: <b>{html.escape(chat_id)}</b>\n\n"
+        "🔗 Endi obuna tugmasi ishlashi uchun kanal havolasini (linkini) yuboring:"
+    )
     await state.set_state(AddChannel.link)
 
-@dp.message(AddChannel.link)
-async def save_channel(message: types.Message, state: FSMContext):
+
+@router.message(AddChannel.link, IsAdmin())
+async def save_channel(message: Message, state: FSMContext) -> None:
+    link = message.text.strip()
+    if not re.match(r"^https?://", link):
+        await message.answer("⚠️ Havola https:// bilan boshlanishi kerak. Qayta yuboring:")
+        return
     data = await state.get_data()
-    db_query("INSERT OR REPLACE INTO channels (chat_id, link) VALUES (?, ?)", (data['chat_id'], message.text.strip()), commit=True)
-    await message.answer("✅ Kanal majburiy obunaga qo'shildi!")
+    await db.execute(
+        "INSERT INTO channels (chat_id, link) VALUES (?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET link=excluded.link",
+        (data["chat_id"], link),
+    )
+    await db.commit()
+    await message.answer("✅ Kanal majburiy obunaga qo'shildi!", reply_markup=get_main_keyboard(message.from_user.id))
     await state.clear()
 
-@dp.callback_query(F.data == "admin:del_channel")
-async def del_channels_menu(call: CallbackQuery):
-    channels = db_query("SELECT chat_id, link FROM channels", fetchall=True)
-    if not channels:
-        return await call.answer("Bazada kanallar yo'q!", show_alert=True)
-    
-    btns = []
-    for ch_id, ch_link in channels:
-        btns.append([InlineKeyboardButton(text=f"❌ O'chirish: {ch_id}", callback_data=f"del_ch:{ch_id}")])
-    await call.message.answer("O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
-@dp.callback_query(F.data.startswith("del_ch:"))
-async def process_del_channel(call: CallbackQuery):
-    ch_id = call.data.split(":")[1]
-    db_query("DELETE FROM channels WHERE chat_id=?", (ch_id,), commit=True)
+@router.callback_query(F.data == "admin:del_channel", IsAdmin())
+async def del_channels_menu(call: CallbackQuery) -> None:
+    cur = await db.execute("SELECT chat_id, link FROM channels")
+    channels = await cur.fetchall()
+    if not channels:
+        await call.answer("Bazada kanallar yo'q!", show_alert=True)
+        return
+
+    btns = [
+        [InlineKeyboardButton(text=f"❌ O'chirish: {row['chat_id']}", callback_data=f"del_ch:{row['chat_id']}")]
+        for row in channels
+    ]
+    await call.message.answer("O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("del_ch:"), IsAdmin())
+async def process_del_channel(call: CallbackQuery) -> None:
+    ch_id = call.data.split(":", 1)[1]
+    await db.execute("DELETE FROM channels WHERE chat_id=?", (ch_id,))
+    await db.commit()
     await call.message.delete()
     await call.answer("Kanal o'chirildi!", show_alert=True)
 
+
 # --- 1. KINO QO'SHISH ---
-@dp.callback_query(F.data == "admin:add_movie")
-async def start_add_movie(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("🎬 Yakkalik kino kodini kiriting (Masalan: 101):")
+@router.callback_query(F.data == "admin:add_movie", IsAdmin())
+async def start_add_movie(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer("🎬 Yakkalik kino kodini kiriting (Masalan: 101):", reply_markup=get_cancel_keyboard())
     await state.set_state(AddMovie.code)
 
-@dp.message(AddMovie.code)
-async def process_movie_code_add(message: types.Message, state: FSMContext):
-    await state.update_data(code=message.text)
-    await message.answer("Kino nomini yozing:")
+
+@router.message(AddMovie.code, IsAdmin())
+async def process_movie_code_add(message: Message, state: FSMContext) -> None:
+    code = message.text.strip()
+    if not code:
+        await message.answer("⚠️ Kod bo'sh bo'lishi mumkin emas. Qayta kiriting:")
+        return
+    existing = await (await db.execute("SELECT 1 FROM movies WHERE code=?", (code,))).fetchone()
+    await state.update_data(code=code, overwrite=bool(existing))
+    if existing:
+        await message.answer(
+            f"⚠️ <code>{html.escape(code)}</code> kodi bazada allaqachon mavjud. "
+            "Davom etsangiz, u qayta yoziladi.\n\nKino nomini yozing:"
+        )
+    else:
+        await message.answer("Kino nomini yozing:")
     await state.set_state(AddMovie.title)
 
-@dp.message(AddMovie.title)
-async def process_movie_title(message: types.Message, state: FSMContext):
-    await state.update_data(title=message.text)
+
+@router.message(AddMovie.title, IsAdmin())
+async def process_movie_title(message: Message, state: FSMContext) -> None:
+    await state.update_data(title=message.text.strip())
     await message.answer("Endi kino videosini (faylini) yuboring:")
     await state.set_state(AddMovie.video)
 
-@dp.message(AddMovie.video)
-async def process_movie_video(message: types.Message, state: FSMContext):
+
+@router.message(AddMovie.video, IsAdmin())
+async def process_movie_video(message: Message, state: FSMContext) -> None:
     if not message.video and not message.document:
-        return await message.answer("Iltimos, video fayl yuboring!")
-        
+        await message.answer("⚠️ Iltimos, video fayl yuboring!")
+        return
+
     file_id = message.video.file_id if message.video else message.document.file_id
     data = await state.get_data()
-    db_query("INSERT OR REPLACE INTO movies (code, title, file_id) VALUES (?, ?, ?)", (data['code'], data['title'], file_id), commit=True)
-    await message.answer(f"✅ Kino saqlandi! Kod: {data['code']}")
+    await db.execute(
+        "INSERT INTO movies (code, title, file_id, added_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(code) DO UPDATE SET title=excluded.title, file_id=excluded.file_id",
+        (data["code"], data["title"], file_id, now_iso()),
+    )
+    await db.commit()
+    await message.answer(
+        f"✅ Kino saqlandi! Kod: <code>{html.escape(data['code'])}</code>",
+        reply_markup=get_main_keyboard(message.from_user.id),
+    )
     await state.clear()
 
+
 # --- 2. SERIAL QO'SHISH ---
-@dp.callback_query(F.data == "admin:add_series")
-async def start_add_series(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("📺 Serial kodini kiriting (Masalan: 200):")
+@router.callback_query(F.data == "admin:add_series", IsAdmin())
+async def start_add_series(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer("📺 Serial kodini kiriting (Masalan: 200):", reply_markup=get_cancel_keyboard())
     await state.set_state(AddSeries.code)
 
-@dp.message(AddSeries.code)
-async def process_series_code_add(message: types.Message, state: FSMContext):
+
+@router.message(AddSeries.code, IsAdmin())
+async def process_series_code_add(message: Message, state: FSMContext) -> None:
     code = message.text.strip()
+    if not code:
+        await message.answer("⚠️ Kod bo'sh bo'lishi mumkin emas. Qayta kiriting:")
+        return
     await state.update_data(code=code)
-    existing = db_query("SELECT title FROM series WHERE code=? LIMIT 1", (code,), fetchone=True)
-    
+
+    existing = await (await db.execute("SELECT title FROM series WHERE code=? LIMIT 1", (code,))).fetchone()
     if existing:
-        title = existing[0]
+        title = existing["title"]
         await state.update_data(title=title)
-        sections = db_query("SELECT DISTINCT section FROM series WHERE code=? AND section IS NOT NULL", (code,), fetchall=True)
-        
-        btns = [[KeyboardButton(text=sec[0])] for sec in sections]
+        cur = await db.execute(
+            "SELECT DISTINCT section FROM series WHERE code=? AND section IS NOT NULL", (code,)
+        )
+        sections = await cur.fetchall()
+
+        btns = [[KeyboardButton(text=row["section"])] for row in sections]
         btns.append([KeyboardButton(text="➕ Yangi bo'lim qo'shish")])
-        
+        btns.append([KeyboardButton(text=CANCEL_TEXT)])
+
         kb = ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True)
-        await message.answer(f"Bu kod bazada mavjud: <b>{title}</b>\nQaysi bo'limga qism qo'shasiz yoki yangi bo'lim ochasizmi?", reply_markup=kb, parse_mode="HTML")
+        await message.answer(
+            f"Bu kod bazada mavjud: <b>{html.escape(title)}</b>\n"
+            "Qaysi bo'limga qism qo'shasiz yoki yangi bo'lim ochasizmi?",
+            reply_markup=kb,
+        )
         await state.set_state(AddSeries.section_choice)
     else:
-        await message.answer("Yangi serial kodi! Umumiy nomini yozing (Masalan: Merlin):")
+        await message.answer(
+            "Yangi serial kodi! Umumiy nomini yozing (Masalan: Merlin):",
+            reply_markup=get_cancel_keyboard(),
+        )
         await state.set_state(AddSeries.title)
 
-@dp.message(AddSeries.title)
-async def process_series_title_add(message: types.Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await message.answer("Bo'lim nomini yozing (Masalan: 1-10 qismlar):", reply_markup=types.ReplyKeyboardRemove())
+
+@router.message(AddSeries.title, IsAdmin())
+async def process_series_title_add(message: Message, state: FSMContext) -> None:
+    await state.update_data(title=message.text.strip())
+    await message.answer("Bo'lim nomini yozing (Masalan: 1-10 qismlar):", reply_markup=get_cancel_keyboard())
     await state.set_state(AddSeries.section)
 
-@dp.message(AddSeries.section_choice)
-async def process_series_section_choice(message: types.Message, state: FSMContext):
+
+@router.message(AddSeries.section_choice, IsAdmin())
+async def process_series_section_choice(message: Message, state: FSMContext) -> None:
     if message.text == "➕ Yangi bo'lim qo'shish":
-        await message.answer("Yangi bo'lim nomini yozing:", reply_markup=types.ReplyKeyboardRemove())
+        await message.answer("Yangi bo'lim nomini yozing:", reply_markup=get_cancel_keyboard())
         await state.set_state(AddSeries.section)
     else:
-        await state.update_data(section=message.text)
-        await message.answer(f"Bo'lim tanlandi: {message.text}\n\nQism raqami yoki nomini yozing (Masalan: 1-qism):", reply_markup=types.ReplyKeyboardRemove())
+        await state.update_data(section=message.text.strip())
+        await message.answer(
+            f"Bo'lim tanlandi: {html.escape(message.text.strip())}\n\n"
+            "Qism raqami yoki nomini yozing (Masalan: 1-qism):",
+            reply_markup=get_cancel_keyboard(),
+        )
         await state.set_state(AddSeries.episode)
 
-@dp.message(AddSeries.section)
-async def process_series_section(message: types.Message, state: FSMContext):
-    await state.update_data(section=message.text)
+
+@router.message(AddSeries.section, IsAdmin())
+async def process_series_section(message: Message, state: FSMContext) -> None:
+    await state.update_data(section=message.text.strip())
     await message.answer("Qism raqami yoki nomini yozing (Masalan: 1-qism):")
     await state.set_state(AddSeries.episode)
 
-@dp.message(AddSeries.episode)
-async def process_series_episode(message: types.Message, state: FSMContext):
-    await state.update_data(episode=message.text)
+
+@router.message(AddSeries.episode, IsAdmin())
+async def process_series_episode(message: Message, state: FSMContext) -> None:
+    await state.update_data(episode=message.text.strip())
     await message.answer("Endi videoni (qismni) yuboring:")
     await state.set_state(AddSeries.video)
 
-@dp.message(AddSeries.video)
-async def process_series_video(message: types.Message, state: FSMContext):
+
+@router.message(AddSeries.video, IsAdmin())
+async def process_series_video(message: Message, state: FSMContext) -> None:
     if not message.video and not message.document:
-        return await message.answer("Iltimos, video yuboring!")
-        
+        await message.answer("⚠️ Iltimos, video yuboring!")
+        return
+
     file_id = message.video.file_id if message.video else message.document.file_id
     data = await state.get_data()
-    db_query("INSERT INTO series (code, title, section, episode, file_id) VALUES (?, ?, ?, ?, ?)", 
-             (data['code'], data['title'], data['section'], data['episode'], file_id), commit=True)
-             
-    await message.answer(f"✅ Serial qismi muvaffaqiyatli saqlandi!\nKod: {data['code']} | Bo'lim: {data['section']} | {data['episode']}", 
-                         reply_markup=get_main_keyboard(message.from_user.id))
+    await db.execute(
+        "INSERT INTO series (code, title, section, episode, file_id, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (data["code"], data["title"], data["section"], data["episode"], file_id, now_iso()),
+    )
+    await db.commit()
+
+    await message.answer(
+        f"✅ Serial qismi muvaffaqiyatli saqlandi!\n"
+        f"Kod: <code>{html.escape(data['code'])}</code> | Bo'lim: {html.escape(data['section'])} | "
+        f"{html.escape(data['episode'])}",
+        reply_markup=get_main_keyboard(message.from_user.id),
+    )
     await state.clear()
 
-async def main():
-    await dp.start_polling(bot)
+
+# --- 3. BROADCAST (BARCHA FOYDALANUVCHILARGA XABAR) ---
+@router.callback_query(F.data == "admin:broadcast", IsAdmin())
+async def start_broadcast(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer(
+        "📣 Barcha foydalanuvchilarga yubormoqchi bo'lgan xabaringizni yuboring "
+        "(matn, rasm, video — caption bilan ham bo'lishi mumkin):",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await state.set_state(Broadcast.content)
+
+
+@router.message(Broadcast.content, IsAdmin())
+async def preview_broadcast(message: Message, state: FSMContext) -> None:
+    await state.update_data(chat_id=message.chat.id, message_id=message.message_id)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Yuborish", callback_data="bcast_confirm:yes"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bcast_confirm:no"),
+            ]
+        ]
+    )
+    await message.answer("⬆️ Ushbu xabar barcha foydalanuvchilarga yuborilsinmi?", reply_markup=kb)
+    await state.set_state(Broadcast.confirm)
+
+
+@router.callback_query(F.data.startswith("bcast_confirm:"), Broadcast.confirm, IsAdmin())
+async def run_broadcast(call: CallbackQuery, state: FSMContext) -> None:
+    answer = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    await state.clear()
+
+    if answer != "yes":
+        await call.message.edit_text("❌ Yuborish bekor qilindi.")
+        return
+
+    await call.message.edit_text("⏳ Yuborilmoqda... Bu biroz vaqt olishi mumkin.")
+
+    cur = await db.execute("SELECT id FROM users")
+    user_ids = [row["id"] for row in await cur.fetchall()]
+
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=data["chat_id"], message_id=data["message_id"])
+            sent += 1
+        except TelegramForbiddenError:
+            failed += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=data["chat_id"], message_id=data["message_id"])
+                sent += 1
+            except Exception:  # noqa: BLE001
+                failed += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Broadcast xatosi (user=%s): %s", uid, e)
+            failed += 1
+        await asyncio.sleep(BROADCAST_DELAY)
+
+    await call.message.answer(f"✅ Yuborildi: {sent} ta\n❌ Yetkazilmadi: {failed} ta")
+
+
+# ============================================================
+#                 XATOLARNI USHLASH
+# ============================================================
+@dp.errors()
+async def global_error_handler(event) -> bool:
+    logger.exception("Kutilmagan xatolik: %s", event.exception)
+    return True
+
+
+# ============================================================
+#                      ISHGA TUSHIRISH
+# ============================================================
+async def set_bot_commands() -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Botni ishga tushirish"),
+            BotCommand(command="help", description="Yordam"),
+            BotCommand(command="cancel", description="Joriy amalni bekor qilish"),
+        ]
+    )
+
+
+async def main() -> None:
+    await init_db()
+    await set_bot_commands()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if db is not None:
+            await db.close()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
