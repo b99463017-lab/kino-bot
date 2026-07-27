@@ -71,8 +71,13 @@ async def init_db() -> None:
         "CREATE TABLE IF NOT EXISTS users ("
         "id INTEGER PRIMARY KEY, full_name TEXT, joined_at TEXT)"
     )
+    # channels jadvaliga rowid o'rniga aniq id ustunini qo'shamiz (callback_data muammosi bo'lmasligi uchun)
     await db.execute(
-        "CREATE TABLE IF NOT EXISTS channels (chat_id TEXT PRIMARY KEY, link TEXT)"
+        """CREATE TABLE IF NOT EXISTS channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT UNIQUE,
+            link TEXT
+        )"""
     )
     await db.execute(
         "CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, title TEXT, file_id TEXT, added_at TEXT)"
@@ -737,14 +742,15 @@ async def save_channel(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin:del_channel", IsAdmin())
 async def del_channels_menu(call: CallbackQuery) -> None:
-    cur = await db.execute("SELECT chat_id, link FROM channels")
+    cur = await db.execute("SELECT id, chat_id, link FROM channels")
     channels = await cur.fetchall()
     if not channels:
         await call.answer("Bazada kanallar yo'q!", show_alert=True)
         return
 
+    # CALLBACK_DATA UZUNLIK LIMITIDAN Qochish uchun chat_id o'rniga jadvaldagi id ishlatildi
     btns = [
-        [InlineKeyboardButton(text=f"❌ O'chirish: {row['chat_id']}", callback_data=f"del_ch:{row['chat_id']}")]
+        [InlineKeyboardButton(text=f"❌ O'chirish: {row['chat_id']}", callback_data=f"del_ch:{row['id']}")]
         for row in channels
     ]
     await call.message.answer("O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
@@ -753,8 +759,8 @@ async def del_channels_menu(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("del_ch:"), IsAdmin())
 async def process_del_channel(call: CallbackQuery) -> None:
-    ch_id = call.data.split(":", 1)[1]
-    await db.execute("DELETE FROM channels WHERE chat_id=?", (ch_id,))
+    ch_db_id = call.data.split(":", 1)[1]
+    await db.execute("DELETE FROM channels WHERE id=?", (ch_db_id,))
     await db.commit()
     await call.message.delete()
     await call.answer("Kanal o'chirildi!", show_alert=True)
