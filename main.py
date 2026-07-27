@@ -270,7 +270,6 @@ async def check_subscription(user_id: int) -> InlineKeyboardMarkup | None:
         if insta_link and insta_link.lower() != "none":
             btns.append([InlineKeyboardButton(text="📸 Instagram sahifamiz", url=insta_link)])
 
-        # Callback data uzunligi oshib ketmasligi uchun statik kalit ishlatamiz
         btns.append([InlineKeyboardButton(text="✅ Obuna bo'ldim", callback_data="sub_check")])
         return InlineKeyboardMarkup(inline_keyboard=btns)
     return None
@@ -347,17 +346,16 @@ async def sub_check_callback(call: CallbackQuery, state: FSMContext) -> None:
         start_text = await get_setting("start")
         await call.message.answer(
             f"✅ Rahmat! Obuna tasdiqlandi.\n\n{start_text}",
-            reply_markup=get_main_keyboard(call.from_user.id),
+            reply_markup=get_main_keyboard(call.message.chat.id),
         )
 
 
 @router.message(F.text.regexp(r"^[A-Za-z0-9_-]+$"), StateFilter(None))
-async def search_handler(message: Message) -> None:
+async def search_handler(message: Message, state: FSMContext) -> None:
     code = message.text.strip()
     sub_kb = await check_subscription(message.from_user.id)
     if sub_kb:
-        await state_data = await dp.fsm.get_context(bot, message.from_user.id, message.chat.id)
-        await state_data.update_data(pending_code=code)
+        await state.update_data(pending_code=code)
         await message.answer("Avval obuna bo'ling:", reply_markup=sub_kb)
         return
     await process_search_code(message.chat.id, code)
