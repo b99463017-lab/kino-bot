@@ -247,7 +247,7 @@ async def check_subscription(user_id: int) -> InlineKeyboardMarkup | None:
 
     unsubbed = []
     for row in channels:
-        ch_id, ch_link = row["chat_id"], row["link"]
+        ch_id, ch_link = str(row["chat_id"]), row["link"]
         try:
             target_chat = ch_id
             if not target_chat.startswith("-100") and not target_chat.startswith("@") and not target_chat.startswith("-"):
@@ -257,14 +257,16 @@ async def check_subscription(user_id: int) -> InlineKeyboardMarkup | None:
                     target_chat = "@" + target_chat
 
             member = await bot.get_chat_member(chat_id=target_chat, user_id=user_id)
-            if member.status in ("left", "kicked", "restricted"):
-                unsubbed.append(ch_link)
+            if member.status in ("left", "kicked"):
+                unsubbed.append((ch_link, target_chat))
         except Exception as e:
             logger.error(f"Obuna tekshirishda xato ({ch_id}): {e}")
-            unsubbed.append(ch_link)
+            unsubbed.append((ch_link, target_chat))
 
     if unsubbed:
-        btns = [[InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=link)] for link in unsubbed]
+        btns = []
+        for i, (link, target_chat) in enumerate(unsubbed, start=1):
+            btns.append([InlineKeyboardButton(text=f"📢 {i}-Kanalga obuna bo'lish", url=link)])
 
         insta_link = await get_setting("instagram")
         if insta_link and insta_link.lower() != "none":
@@ -356,9 +358,11 @@ async def search_handler(message: Message, state: FSMContext) -> None:
     sub_kb = await check_subscription(message.from_user.id)
     if sub_kb:
         await state.update_data(pending_code=code)
-        await message.answer("Avval obuna bo'ling:", reply_markup=sub_kb)
+        await message.answer("🍿 Kinoni ko'rish uchun avval kanallarimizga obuna bo'ling:", reply_markup=sub_kb)
         return
-state_data = await state.get_data()
+
+    await process_search_code(message.chat.id, code)
+
 
 async def process_search_code(chat_id: int, code: str) -> None:
     cur = await db.execute("SELECT title, file_id FROM movies WHERE code=?", (code,))
