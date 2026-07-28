@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Union
 
 import aiosqlite
 from dotenv import load_dotenv
@@ -23,7 +24,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-# Muhit o'zgaruvchilarini yuklash
+# 1. Muhit o'zgaruvchilarini yuklaymiz
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -33,19 +34,25 @@ if not BOT_TOKEN:
     print("❌ XATOLIK: .env faylida BOT_TOKEN topilmadi!")
     sys.exit(1)
 
-# Ma'lumotlar bazasi fayli
+# Ma'lumotlar bazasi faylining nomi
 DB_PATH = "data.db"
 
-# ------------------- MA'LUMOTLAR BAZASI FUNKSIYALARI -------------------
+
+# =========================================================================
+# 2. MA'LUMOTLAR BAZASI BILAN ISHLASH (SQLITE)
+# =========================================================================
 
 async def init_db():
+    """Bot ishga tushganda bazani va jadvallarni yaratadi"""
     async with aiosqlite.connect(DB_PATH) as db:
+        # Foydalanuvchilar jadvali
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Kanallar va guruhlar jadvali
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,13 +61,14 @@ async def init_db():
                 title TEXT
             )
         """)
+        # Adminlar jadvali
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY
             )
         """)
         
-        # .env dan olingan asosiy adminlarni qo'shish
+        # .env faylidan kelgan adminlarni bazaga qo'shish
         if ADMIN_IDS_ENV:
             for admin_str in ADMIN_IDS_ENV.split(","):
                 admin_str = admin_str.strip()
@@ -72,44 +80,52 @@ async def init_db():
         await db.commit()
 
 async def add_user(user_id: int):
+    """Yangi foydalanuvchini bazaga qo'shish"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
         await db.commit()
 
 async def get_users_count() -> int:
+    """Jami foydalanuvchilar sonini olish"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cursor:
             res = await cursor.fetchone()
             return res[0] if res else 0
 
 async def get_all_users() -> list[int]:
+    """Barcha foydalanuvchilar ID raqamlarini olish (Rassilka uchun)"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
             rows = await cursor.fetchall()
             return [r[0] for r in rows]
 
 async def get_admins() -> list[int]:
+    """Barcha adminlar ro'yxatini olish"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM admins") as cursor:
             rows = await cursor.fetchall()
             return [r[0] for r in rows]
 
 async def add_admin(user_id: int):
+    """Yangi admin qo'shish"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
         await db.commit()
 
 async def remove_admin(user_id: int):
+    """Adminni o'chirish"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
         await db.commit()
 
 async def get_channels():
+    """Ulangan barcha kanal va guruhlarni olish"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT chat_id, link, title FROM channels") as cursor:
             return await cursor.fetchall()
 
 async def add_channel(chat_id: str, link: str, title: str):
+    """Kanal yoki guruhni bazaga saqlash"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO channels (chat_id, link, title) VALUES (?, ?, ?)",
@@ -118,13 +134,18 @@ async def add_channel(chat_id: str, link: str, title: str):
         await db.commit()
 
 async def delete_channel(chat_id: str):
+    """Kanal yoki guruhni bazadan o'chirish"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM channels WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
-# ------------------- FILTR VA HOLATLAR -------------------
+
+# =========================================================================
+# 3. FILTRLAR VA FSM (HOLATLAR)
+# =========================================================================
 
 class IsAdmin(BaseFilter):
+    """Foydalanuvchi admin ekanligini tekshiruvchi maxsus filtr"""
     async def __call__(self, message: Message) -> bool:
         admins = await get_admins()
         return message.from_user.id in admins
@@ -139,9 +160,13 @@ class AddAdminState(StatesGroup):
 class BroadcastState(StatesGroup):
     message = State()
 
-# ------------------- KLAVIATURALAR -------------------
 
-def get_admin_main_kb():
+# =========================================================================
+# 4. TUGMALAR (KEYBOARDS)
+# =========================================================================
+
+def get_admin_main_kb() -> ReplyKeyboardMarkup:
+    """Admin panelning asosiy menyusi"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="📢 Kanal/Guruh qo'shish")],
@@ -151,15 +176,20 @@ def get_admin_main_kb():
         resize_keyboard=True
     )
 
-def get_cancel_kb():
+def get_cancel_kb() -> ReplyKeyboardMarkup:
+    """Amalni bekor qilish tugmasi"""
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
         resize_keyboard=True
     )
 
-# ------------------- OBUNA TEKSHIRISH -------------------
 
-async def check_subscriptions(bot: Bot, user_id: int):
+# =========================================================================
+# 5. MAJBURIY OBUNANI TEKSHIRISH
+# =========================================================================
+
+async def check_subscriptions(bot: Bot, user_id: int) -> list:
+    """Foydalanuvchi barcha kanallarga obuna bo'lganligini tekshiradi"""
     channels = await get_channels()
     unsubscribed = []
     
@@ -173,7 +203,10 @@ async def check_subscriptions(bot: Bot, user_id: int):
             
     return unsubscribed
 
-# ------------------- ASOSIY ROUTER -------------------
+
+# =========================================================================
+# 6. HANDLERLAR (BOT BUYRUQLari VA XABARLARI)
+# =========================================================================
 
 router = Router()
 
@@ -218,10 +251,10 @@ async def cancel_handler(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("🛑 Amal bekor qilindi.", reply_markup=get_admin_main_kb())
 
-# ------------------- ADMIN PANEL -------------------
+
+# --- ADMIN PANEL BO'LIMI ---
 
 @router.message(Command("admin"), IsAdmin())
-@router.message(F.text == "⚙️ Admin Panel", IsAdmin())
 async def admin_panel(message: Message):
     await message.answer("🔑 <b>Admin Panelga xush kelibsiz!</b>", reply_markup=get_admin_main_kb())
 
@@ -238,7 +271,7 @@ async def show_stats(message: Message):
         f"👑 Adminlar soni: <b>{len(admins)} ta</b>"
     )
 
-# --- KANAL / GURUH QO'SHISH ---
+# Kanal yoki guruh qo'shish jarayoni
 @router.message(F.text == "📢 Kanal/Guruh qo'shish", IsAdmin())
 async def start_add_channel(message: Message, state: FSMContext):
     await state.set_state(AddChannelState.chat_id)
@@ -295,7 +328,7 @@ async def process_channel_link(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await message.answer(f"🎉 <b>{html.escape(title)}</b> muvaffaqiyatli saqlandi!", reply_markup=get_admin_main_kb())
 
-# --- KANAL O'CHIRISH ---
+# Kanal yoki guruhni o'chirish
 @router.message(F.text == "🗑 Kanal/Guruh o'chirish", IsAdmin())
 async def list_channels_delete(message: Message):
     channels = await get_channels()
@@ -315,7 +348,7 @@ async def delete_channel_callback(query: CallbackQuery):
     await query.answer("Muvaffaqiyatli o'chirildi!", show_alert=True)
     await query.message.delete()
 
-# --- ADMINLARNI BOSHQARISH ---
+# Adminlarni boshqarish
 @router.message(F.text == "👥 Adminlarni boshqarish", IsAdmin())
 async def manage_admins(message: Message):
     admins = await get_admins()
@@ -358,7 +391,7 @@ async def remove_admin_callback(query: CallbackQuery):
     await query.answer("Admin o'chirildi!", show_alert=True)
     await query.message.delete()
 
-# --- XABAR YUBORISH (RASSILKA) ---
+# Rassilka (Xabar yuborish)
 @router.message(F.text == "✉️ Xabar yuborish (Rassilka)", IsAdmin())
 async def start_broadcast(message: Message, state: FSMContext):
     await state.set_state(BroadcastState.message)
@@ -391,7 +424,10 @@ async def process_broadcast(message: Message, state: FSMContext, bot: Bot):
         f"🔴 Yetib bormadi (bloklagan/o'chirilgan): <b>{blocked} ta</b>"
     )
 
-# ------------------- ISHGA TUSHIRISH -------------------
+
+# =========================================================================
+# 7. BOTNI ISHGA TUSHIRISH (MAIN)
+# =========================================================================
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -401,7 +437,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     
-    print("🤖 Bot muvaffaqiyatli ishga tushdi!")
+    print("🤖 Bot muvaffaqiyatli ishga tushdi va ishga tayyor!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
